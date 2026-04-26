@@ -1,0 +1,44 @@
+.DS_Store
+._*
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# Local virtual environments
+.venv/
+venv/
+env/
+.python-version
+
+# Dataset artifacts
+train/
+val/
+test_public/
+dlav-2026-phase-1/
+*.zip
+
+# Training outputs
+outputs/
+checkpoints/
+submission_phase1.csv
+wandb/
+runs/
+*.pt
+*.pth
+*.ckpt
+
+# IDE files
+.vscode/
+.idea/
+
+#notebooks
+notebooks/*.ipynb
