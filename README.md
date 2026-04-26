@@ -18,15 +18,17 @@ The model follows the Milestone 1 input constraints and only uses:
 
 ```text
 .
-├── egodrive/
+├── src/
 │   ├── data.py
+│   ├── infer.py
 │   ├── metrics.py
 │   ├── model.py
+│   ├── train.py
 │   └── utils.py
-├── notebooks/
-│   └── DLAV_Phase1.ipynb
 ├── train.py
 ├── infer.py
+├── notebooks/
+│   └── DLAV_Phase1.ipynb
 ├── requirements.txt
 └── README.md
 ```
@@ -111,5 +113,5 @@ id, x_1, y_1, x_2, y_2, ..., x_60, y_60
 ## Notes
 
 - The notebook in `notebooks/` is kept as the original course reference.
-- The script entry points are now `train.py` and `infer.py`.
+- The script entry points are `train.py` and `infer.py`, which call into `src/`.
 - Validation is reported with ADE and FDE, while the training loss uses Smooth L1 on the trajectory with a smaller heading weight.

@@ -9,9 +9,9 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from egodrive.data import DrivingDataset, list_pickle_files
-from egodrive.model import EgoDrivePlanner
-from egodrive.utils import get_device
+from src.data import DrivingDataset, list_pickle_files
+from src.model import EgoDrivePlanner
+from src.utils import get_device
 
 
 def build_argparser() -> argparse.ArgumentParser:

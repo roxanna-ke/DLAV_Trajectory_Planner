@@ -8,10 +8,10 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from egodrive.data import DrivingDataset, list_pickle_files
-from egodrive.metrics import displacement_errors, trajectory_loss
-from egodrive.model import EgoDrivePlanner
-from egodrive.utils import ensure_dir, get_device, save_json, set_seed
+from src.data import DrivingDataset, list_pickle_files
+from src.metrics import displacement_errors, trajectory_loss
+from src.model import EgoDrivePlanner
+from src.utils import ensure_dir, get_device, save_json, set_seed
 
 
 def build_argparser() -> argparse.ArgumentParser:
