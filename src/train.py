@@ -56,6 +56,16 @@ def freeze_backbone_parameters(model: EgoDrivePlanner) -> None:
         parameter.requires_grad = False
 
 
+def freeze_backbone_batchnorm(model: EgoDrivePlanner) -> None:
+    for module in model.backbone.modules():
+        if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
+            module.eval()
+            if module.weight is not None:
+                module.weight.requires_grad_(False)
+            if module.bias is not None:
+                module.bias.requires_grad_(False)
+
+
 def evaluate(
     model: EgoDrivePlanner,
     dataloader: DataLoader,
@@ -195,6 +205,7 @@ def main() -> None:
 
     for epoch in range(1, args.epochs + 1):
         model.train()
+        freeze_backbone_batchnorm(model)
         running_loss = 0.0
         running_xy_loss = 0.0
         running_heading_loss = 0.0
