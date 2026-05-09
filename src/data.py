@@ -18,10 +18,16 @@ COMMAND_TO_INDEX = {
 }
 
 
-def build_eval_camera_transform(image_size: int = 224) -> transforms.Compose:
+def build_eval_camera_transform(
+    image_height: int = 224,
+    image_width: int = 336,
+) -> transforms.Compose:
     return transforms.Compose(
         [
-            transforms.Resize((image_size, image_size), interpolation=InterpolationMode.BILINEAR),
+            transforms.Resize(
+                (image_height, image_width),
+                interpolation=InterpolationMode.BILINEAR,
+            ),
             transforms.ToTensor(),
             transforms.Normalize(
                 mean=[0.485, 0.456, 0.406],
@@ -31,30 +37,26 @@ def build_eval_camera_transform(image_size: int = 224) -> transforms.Compose:
     )
 
 
-def build_train_camera_transform(image_size: int = 224) -> transforms.Compose:
+def build_train_camera_transform(
+    image_height: int = 224,
+    image_width: int = 336,
+) -> transforms.Compose:
     return transforms.Compose(
         [
-            transforms.Resize((image_size, image_size), interpolation=InterpolationMode.BILINEAR),
-            transforms.ColorJitter(
-                brightness=0.15,
-                contrast=0.15,
-                saturation=0.10,
-                hue=0.03,
-            ),
-            transforms.RandomApply(
-                [transforms.GaussianBlur(kernel_size=5, sigma=(0.1, 1.5))],
-                p=0.20,
+            transforms.Resize(
+                (image_height, image_width),
+                interpolation=InterpolationMode.BILINEAR,
             ),
             transforms.ToTensor(),
+            transforms.ColorJitter(
+                brightness=0.2,
+                contrast=0.2,
+                saturation=0.2,
+                hue=0.05,
+            ),
             transforms.Normalize(
                 mean=[0.485, 0.456, 0.406],
                 std=[0.229, 0.224, 0.225],
-            ),
-            transforms.RandomErasing(
-                p=0.20,
-                scale=(0.02, 0.08),
-                ratio=(0.5, 1.5),
-                value="random", 
             ),
         ]
     )
@@ -75,15 +77,24 @@ class DrivingDataset(Dataset):
         *,
         test: bool = False,
         augment: bool = False,
-        image_size: int = 224,
+        image_height: int = 224,
+        image_width: int = 336,
     ) -> None:
         self.samples = [Path(path) for path in file_list]
         self.test = test
-        self.image_size = image_size
+        self.augment = augment
+        self.image_height = image_height
+        self.image_width = image_width
         self.camera_transform = (
-            build_eval_camera_transform(image_size=image_size)
+            build_eval_camera_transform(
+                image_height=image_height,
+                image_width=image_width,
+            )
             if test or not augment
-            else build_train_camera_transform(image_size=image_size)
+            else build_train_camera_transform(
+                image_height=image_height,
+                image_width=image_width,
+            )
         )
 
     def __len__(self) -> int:
@@ -99,6 +110,9 @@ class DrivingDataset(Dataset):
 
         command = COMMAND_TO_INDEX[data["driving_command"]]
         history = torch.as_tensor(data["sdc_history_feature"], dtype=torch.float32)
+        if self.augment and not self.test:
+            history = history.clone()
+            history[:, :2] += torch.randn_like(history[:, :2]) * 0.05
 
         item: dict[str, torch.Tensor | int] = {
             "camera": camera_tensor,
@@ -127,7 +141,7 @@ class DrivingDataset(Dataset):
 
         resized = torch_f.interpolate(
             depth_tensor.unsqueeze(0),
-            size=(self.image_size, self.image_size),
+            size=(self.image_height, self.image_width),
             mode="bilinear",
             align_corners=False,
         )
@@ -146,7 +160,7 @@ class DrivingDataset(Dataset):
 
         resized = torch_f.interpolate(
             segmentation_tensor.unsqueeze(0),
-            size=(self.image_size, self.image_size),
+            size=(self.image_height, self.image_width),
             mode="nearest",
         )
         return resized.squeeze(0).squeeze(0).long()
