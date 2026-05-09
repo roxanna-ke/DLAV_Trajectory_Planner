@@ -25,7 +25,9 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--no-pretrained", action="store_true")
     parser.add_argument("--freeze-backbone", action="store_true")
-    parser.add_argument("--image-size", type=int, default=224)
+    parser.add_argument("--image-size", type=int, default=None)
+    parser.add_argument("--image-height", type=int, default=224)
+    parser.add_argument("--image-width", type=int, default=336)
     parser.add_argument("--image-feature-dim", type=int, default=256)
     parser.add_argument("--history-hidden-dim", type=int, default=128)
     parser.add_argument("--command-feature-dim", type=int, default=32)
@@ -119,6 +121,10 @@ def evaluate(
 
 def main() -> None:
     args = build_argparser().parse_args()
+    if args.image_size is not None:
+        args.image_height = args.image_size
+        args.image_width = args.image_size
+
     set_seed(args.seed)
     device = get_device()
 
@@ -127,8 +133,18 @@ def main() -> None:
     train_files = list_pickle_files(args.train_dir, args.max_train_samples)
     val_files = list_pickle_files(args.val_dir, args.max_val_samples)
 
-    train_dataset = DrivingDataset(train_files, augment=True, image_size=args.image_size)
-    val_dataset = DrivingDataset(val_files, augment=False, image_size=args.image_size)
+    train_dataset = DrivingDataset(
+        train_files,
+        augment=True,
+        image_height=args.image_height,
+        image_width=args.image_width,
+    )
+    val_dataset = DrivingDataset(
+        val_files,
+        augment=False,
+        image_height=args.image_height,
+        image_width=args.image_width,
+    )
 
     train_loader = DataLoader(
         train_dataset,

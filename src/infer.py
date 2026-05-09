@@ -27,6 +27,8 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--image-size", type=int, default=None)
+    parser.add_argument("--image-height", type=int, default=None)
+    parser.add_argument("--image-width", type=int, default=None)
     parser.add_argument("--max-test-samples", type=int, default=None)
     return parser
 
@@ -36,12 +38,21 @@ def load_model(
     *,
     device: torch.device,
     image_size_override: int | None,
-) -> tuple[EgoDrivePlanner, int]:
+    image_height_override: int | None,
+    image_width_override: int | None,
+) -> tuple[EgoDrivePlanner, int, int]:
     checkpoint = torch.load(checkpoint_path, map_location=device)
     config = checkpoint["config"]
-    image_size = (
-        image_size_override if image_size_override is not None else config["image_size"]
-    )
+    if image_size_override is not None:
+        image_height = image_size_override
+        image_width = image_size_override
+    else:
+        image_height = image_height_override
+        image_width = image_width_override
+        if image_height is None:
+            image_height = config.get("image_height", config.get("image_size", 224))
+        if image_width is None:
+            image_width = config.get("image_width", config.get("image_size", 224))
 
     model = EgoDrivePlanner(
         pretrained_backbone=False,
@@ -60,20 +71,31 @@ def load_model(
     model.load_state_dict(checkpoint["model_state_dict"])
     model.to(device)
     model.eval()
-    return model, image_size
+    return model, image_height, image_width
 
 
 def main() -> None:
     args = build_argparser().parse_args()
     device = get_device()
-    model, image_size = load_model(
+    if args.image_size is not None:
+        args.image_height = args.image_size
+        args.image_width = args.image_size
+
+    model, image_height, image_width = load_model(
         args.checkpoint,
         device=device,
         image_size_override=args.image_size,
+        image_height_override=args.image_height,
+        image_width_override=args.image_width,
     )
 
     test_files = list_pickle_files(args.test_dir, args.max_test_samples)
-    dataset = DrivingDataset(test_files, test=True, image_size=image_size)
+    dataset = DrivingDataset(
+        test_files,
+        test=True,
+        image_height=image_height,
+        image_width=image_width,
+    )
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,

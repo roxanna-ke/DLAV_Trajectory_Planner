@@ -77,15 +77,87 @@ class DensePredictionDecoder(nn.Module):
         self.refine_224 = ConvBlock(in_channels=64, out_channels=32)
         self.head = nn.Conv2d(32, out_channels, kernel_size=1)
 
-    def forward(self, features: dict[str, torch.Tensor]) -> torch.Tensor:
+    def forward(
+        self,
+        features: dict[str, torch.Tensor],
+        *,
+        return_features: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         x = self.up4(features["layer4"], features["layer3"])
         x = self.up3(x, features["layer2"])
         x = self.up2(x, features["layer1"])
         x = torch_f.interpolate(x, scale_factor=2.0, mode="bilinear", align_corners=False)
         x = self.refine_112(x)
         x = torch_f.interpolate(x, scale_factor=2.0, mode="bilinear", align_corners=False)
-        x = self.refine_224(x)
-        return self.head(x)
+        refined = self.refine_224(x)
+        prediction = self.head(refined)
+        if return_features:
+            return prediction, refined
+        return prediction
+
+
+class SpatialVisualTokenizer(nn.Module):
+    def __init__(
+        self,
+        *,
+        token_dim: int,
+        layer3_grid: tuple[int, int] = (4, 6),
+        layer4_grid: tuple[int, int] = (2, 3),
+    ) -> None:
+        super().__init__()
+        self.layer3_pool = nn.AdaptiveAvgPool2d(layer3_grid)
+        self.layer4_pool = nn.AdaptiveAvgPool2d(layer4_grid)
+        self.layer3_projection = nn.Conv2d(256, token_dim, kernel_size=1, bias=False)
+        self.layer4_projection = nn.Conv2d(512, token_dim, kernel_size=1, bias=False)
+
+        layer3_tokens = layer3_grid[0] * layer3_grid[1]
+        layer4_tokens = layer4_grid[0] * layer4_grid[1]
+        self.layer3_position_embeddings = nn.Parameter(
+            torch.zeros(1, layer3_tokens, token_dim)
+        )
+        self.layer4_position_embeddings = nn.Parameter(
+            torch.zeros(1, layer4_tokens, token_dim)
+        )
+        self.layer3_level_embedding = nn.Parameter(torch.zeros(1, 1, token_dim))
+        self.layer4_level_embedding = nn.Parameter(torch.zeros(1, 1, token_dim))
+
+    def forward(self, features: dict[str, torch.Tensor]) -> torch.Tensor:
+        layer3_tokens = self.layer3_pool(self.layer3_projection(features["layer3"]))
+        layer4_tokens = self.layer4_pool(self.layer4_projection(features["layer4"]))
+
+        layer3_tokens = layer3_tokens.flatten(2).transpose(1, 2)
+        layer4_tokens = layer4_tokens.flatten(2).transpose(1, 2)
+
+        layer3_tokens = (
+            layer3_tokens
+            + self.layer3_position_embeddings
+            + self.layer3_level_embedding
+        )
+        layer4_tokens = (
+            layer4_tokens
+            + self.layer4_position_embeddings
+            + self.layer4_level_embedding
+        )
+        return torch.cat([layer3_tokens, layer4_tokens], dim=1)
+
+
+class AuxiliaryTokenEncoder(nn.Module):
+    def __init__(self, in_channels: int, token_dim: int) -> None:
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Conv2d(in_channels, 64, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d((1, 1)),
+        )
+        self.projection = nn.Linear(64, token_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.encoder(x).flatten(1)
+        return self.projection(x)
 
 
 class AttentionFusion(nn.Module):
@@ -102,10 +174,14 @@ class AttentionFusion(nn.Module):
         super().__init__()
         self.history_projection = nn.Linear(history_hidden_dim, fusion_dim)
         self.command_projection = nn.Linear(command_feature_dim, fusion_dim)
-        self.layer3_projection = nn.Linear(256, fusion_dim)
-        self.layer4_projection = nn.Linear(512, fusion_dim)
+        self.depth_projection = nn.Linear(image_feature_dim, fusion_dim)
+        self.segmentation_projection = nn.Linear(image_feature_dim, fusion_dim)
         self.cls_token = nn.Parameter(torch.zeros(1, 1, fusion_dim))
-        self.token_embeddings = nn.Parameter(torch.zeros(1, 5, fusion_dim))
+        self.cls_embedding = nn.Parameter(torch.zeros(1, fusion_dim))
+        self.history_embedding = nn.Parameter(torch.zeros(1, fusion_dim))
+        self.command_embedding = nn.Parameter(torch.zeros(1, fusion_dim))
+        self.depth_embedding = nn.Parameter(torch.zeros(1, fusion_dim))
+        self.segmentation_embedding = nn.Parameter(torch.zeros(1, fusion_dim))
 
         self.norm1 = nn.LayerNorm(fusion_dim)
         self.attention = nn.MultiheadAttention(
@@ -133,21 +209,25 @@ class AttentionFusion(nn.Module):
         *,
         history_features: torch.Tensor,
         command_features: torch.Tensor,
-        layer3_pool: torch.Tensor,
-        layer4_pool: torch.Tensor,
+        visual_tokens: torch.Tensor,
+        depth_token: torch.Tensor | None = None,
+        segmentation_token: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        history_token = self.history_projection(history_features)
-        command_token = self.command_projection(command_features)
-        layer3_token = self.layer3_projection(layer3_pool)
-        layer4_token = self.layer4_projection(layer4_pool)
+        history_token = self.history_projection(history_features) + self.history_embedding
+        command_token = self.command_projection(command_features) + self.command_embedding
 
-        tokens = torch.stack(
-            [history_token, command_token, layer3_token, layer4_token],
-            dim=1,
-        )
-        cls_token = self.cls_token.expand(tokens.size(0), -1, -1)
-        tokens = torch.cat([cls_token, tokens], dim=1)
-        tokens = tokens + self.token_embeddings
+        token_list = [history_token, command_token]
+        if depth_token is not None:
+            token_list.append(self.depth_projection(depth_token) + self.depth_embedding)
+        if segmentation_token is not None:
+            token_list.append(
+                self.segmentation_projection(segmentation_token)
+                + self.segmentation_embedding
+            )
+
+        tokens = torch.stack(token_list, dim=1)
+        cls_token = self.cls_token.expand(tokens.size(0), -1, -1) + self.cls_embedding
+        tokens = torch.cat([cls_token, tokens, visual_tokens], dim=1)
 
         attended, _ = self.attention(
             self.norm1(tokens),
@@ -183,7 +263,7 @@ class EgoDrivePlanner(nn.Module):
         self.use_segmentation_head = use_segmentation_head
 
         self.backbone = ResNet34Backbone(pretrained=pretrained_backbone)
-        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.visual_tokenizer = SpatialVisualTokenizer(token_dim=fusion_dim)
 
         gru_dropout = dropout if history_layers > 1 else 0.0
         self.history_encoder = nn.GRU(
@@ -219,6 +299,19 @@ class EgoDrivePlanner(nn.Module):
             if use_segmentation_head
             else None
         )
+        self.depth_token_encoder = (
+            AuxiliaryTokenEncoder(in_channels=33, token_dim=image_feature_dim)
+            if use_depth_head
+            else None
+        )
+        self.segmentation_token_encoder = (
+            AuxiliaryTokenEncoder(
+                in_channels=32 + num_segmentation_classes,
+                token_dim=image_feature_dim,
+            )
+            if use_segmentation_head
+            else None
+        )
 
     def forward(
         self,
@@ -227,25 +320,50 @@ class EgoDrivePlanner(nn.Module):
         command: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         features = self.backbone(camera)
-        layer3_pool = self.avgpool(features["layer3"]).flatten(1)
-        layer4_pool = self.avgpool(features["layer4"]).flatten(1)
+        visual_tokens = self.visual_tokenizer(features)
+        depth_token = None
+        segmentation_token = None
 
         _, history_hidden = self.history_encoder(history)
         history_features = history_hidden[-1]
         command_features = self.command_embedding(command)
 
+        outputs: dict[str, torch.Tensor] = {}
+        if self.depth_decoder is not None:
+            depth_prediction, depth_features = self.depth_decoder(
+                features,
+                return_features=True,
+            )
+            outputs["depth"] = depth_prediction
+            if self.depth_token_encoder is not None:
+                depth_token = self.depth_token_encoder(
+                    torch.cat([depth_features, depth_prediction], dim=1)
+                )
+
+        if self.segmentation_decoder is not None:
+            segmentation_logits, segmentation_features = self.segmentation_decoder(
+                features,
+                return_features=True,
+            )
+            outputs["segmentation_logits"] = segmentation_logits
+            if self.segmentation_token_encoder is not None:
+                segmentation_probabilities = torch.softmax(segmentation_logits, dim=1)
+                segmentation_token = self.segmentation_token_encoder(
+                    torch.cat(
+                        [segmentation_features, segmentation_probabilities],
+                        dim=1,
+                    )
+                )
+
         fused_features = self.fusion(
             history_features=history_features,
             command_features=command_features,
-            layer3_pool=layer3_pool,
-            layer4_pool=layer4_pool,
+            visual_tokens=visual_tokens,
+            depth_token=depth_token,
+            segmentation_token=segmentation_token,
         )
         future = self.trajectory_decoder(fused_features)
         trajectory = future.view(camera.size(0), self.future_steps, 3)
 
-        outputs = {"trajectory": trajectory}
-        if self.depth_decoder is not None:
-            outputs["depth"] = self.depth_decoder(features)
-        if self.segmentation_decoder is not None:
-            outputs["segmentation_logits"] = self.segmentation_decoder(features)
+        outputs["trajectory"] = trajectory
         return outputs
