@@ -362,8 +362,9 @@ class EgoDrivePlanner(nn.Module):
             depth_token=depth_token,
             segmentation_token=segmentation_token,
         )
-        future = self.trajectory_decoder(fused_features)
-        trajectory = future.view(camera.size(0), self.future_steps, 3)
+        trajectory_deltas = self.trajectory_decoder(fused_features)
+        trajectory_deltas = trajectory_deltas.view(camera.size(0), self.future_steps, 3)
+        trajectory = torch.cumsum(trajectory_deltas, dim=1)
 
         outputs["trajectory"] = trajectory
         return outputs

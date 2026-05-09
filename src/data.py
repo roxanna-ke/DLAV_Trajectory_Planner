@@ -110,9 +110,6 @@ class DrivingDataset(Dataset):
 
         command = COMMAND_TO_INDEX[data["driving_command"]]
         history = torch.as_tensor(data["sdc_history_feature"], dtype=torch.float32)
-        if self.augment and not self.test:
-            history = history.clone()
-            history[:, :2] += torch.randn_like(history[:, :2]) * 0.05
 
         item: dict[str, torch.Tensor | int] = {
             "camera": camera_tensor,
