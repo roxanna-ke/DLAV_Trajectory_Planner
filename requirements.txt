@@ -1,0 +1,6 @@
+torch>=2.3,<2.8
+torchvision>=0.18,<0.23
+pandas>=2.0,<3.0
+numpy>=1.24,<3.0
+Pillow>=9.5,<12.0
+tqdm>=4.66,<5.0
