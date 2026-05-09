@@ -96,51 +96,6 @@ class DensePredictionDecoder(nn.Module):
         return prediction
 
 
-class SpatialVisualTokenizer(nn.Module):
-    def __init__(
-        self,
-        *,
-        token_dim: int,
-        layer3_grid: tuple[int, int] = (4, 6),
-        layer4_grid: tuple[int, int] = (2, 3),
-    ) -> None:
-        super().__init__()
-        self.layer3_pool = nn.AdaptiveAvgPool2d(layer3_grid)
-        self.layer4_pool = nn.AdaptiveAvgPool2d(layer4_grid)
-        self.layer3_projection = nn.Conv2d(256, token_dim, kernel_size=1, bias=False)
-        self.layer4_projection = nn.Conv2d(512, token_dim, kernel_size=1, bias=False)
-
-        layer3_tokens = layer3_grid[0] * layer3_grid[1]
-        layer4_tokens = layer4_grid[0] * layer4_grid[1]
-        self.layer3_position_embeddings = nn.Parameter(
-            torch.zeros(1, layer3_tokens, token_dim)
-        )
-        self.layer4_position_embeddings = nn.Parameter(
-            torch.zeros(1, layer4_tokens, token_dim)
-        )
-        self.layer3_level_embedding = nn.Parameter(torch.zeros(1, 1, token_dim))
-        self.layer4_level_embedding = nn.Parameter(torch.zeros(1, 1, token_dim))
-
-    def forward(self, features: dict[str, torch.Tensor]) -> torch.Tensor:
-        layer3_tokens = self.layer3_pool(self.layer3_projection(features["layer3"]))
-        layer4_tokens = self.layer4_pool(self.layer4_projection(features["layer4"]))
-
-        layer3_tokens = layer3_tokens.flatten(2).transpose(1, 2)
-        layer4_tokens = layer4_tokens.flatten(2).transpose(1, 2)
-
-        layer3_tokens = (
-            layer3_tokens
-            + self.layer3_position_embeddings
-            + self.layer3_level_embedding
-        )
-        layer4_tokens = (
-            layer4_tokens
-            + self.layer4_position_embeddings
-            + self.layer4_level_embedding
-        )
-        return torch.cat([layer3_tokens, layer4_tokens], dim=1)
-
-
 class AuxiliaryTokenEncoder(nn.Module):
     def __init__(self, in_channels: int, token_dim: int) -> None:
         super().__init__()
@@ -160,7 +115,7 @@ class AuxiliaryTokenEncoder(nn.Module):
         return self.projection(x)
 
 
-class AttentionFusion(nn.Module):
+class LightweightFusion(nn.Module):
     def __init__(
         self,
         *,
@@ -168,38 +123,45 @@ class AttentionFusion(nn.Module):
         command_feature_dim: int,
         image_feature_dim: int,
         fusion_dim: int,
-        num_heads: int,
         dropout: float,
+        use_depth_token: bool,
+        use_segmentation_token: bool,
     ) -> None:
         super().__init__()
-        self.history_projection = nn.Linear(history_hidden_dim, fusion_dim)
-        self.command_projection = nn.Linear(command_feature_dim, fusion_dim)
-        self.depth_projection = nn.Linear(image_feature_dim, fusion_dim)
-        self.segmentation_projection = nn.Linear(image_feature_dim, fusion_dim)
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, fusion_dim))
-        self.cls_embedding = nn.Parameter(torch.zeros(1, fusion_dim))
-        self.history_embedding = nn.Parameter(torch.zeros(1, fusion_dim))
-        self.command_embedding = nn.Parameter(torch.zeros(1, fusion_dim))
-        self.depth_embedding = nn.Parameter(torch.zeros(1, fusion_dim))
-        self.segmentation_embedding = nn.Parameter(torch.zeros(1, fusion_dim))
+        self.use_depth_token = use_depth_token
+        self.use_segmentation_token = use_segmentation_token
 
-        self.norm1 = nn.LayerNorm(fusion_dim)
-        self.attention = nn.MultiheadAttention(
-            embed_dim=fusion_dim,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True,
-        )
-        self.norm2 = nn.LayerNorm(fusion_dim)
-        self.feed_forward = nn.Sequential(
-            nn.Linear(fusion_dim, fusion_dim * 4),
-            nn.GELU(),
+        self.layer3_scale = nn.Linear(command_feature_dim, 256)
+        self.layer3_bias = nn.Linear(command_feature_dim, 256)
+        self.layer4_scale = nn.Linear(command_feature_dim, 512)
+        self.layer4_bias = nn.Linear(command_feature_dim, 512)
+
+        self.layer3_reduce = nn.Conv2d(256, 32, kernel_size=1, bias=False)
+        self.layer4_reduce = nn.Conv2d(512, 64, kernel_size=1, bias=False)
+        self.layer3_pool = nn.AdaptiveAvgPool2d((4, 6))
+        self.layer4_pool = nn.AdaptiveAvgPool2d((2, 3))
+
+        visual_dim = 32 * 4 * 6 + 64 * 2 * 3
+        self.visual_mlp = nn.Sequential(
+            nn.Linear(visual_dim, 512),
+            nn.ReLU(inplace=True),
             nn.Dropout(dropout),
-            nn.Linear(fusion_dim * 4, fusion_dim),
+            nn.Linear(512, image_feature_dim),
+            nn.ReLU(inplace=True),
         )
-        self.output_projection = nn.Sequential(
-            nn.LayerNorm(fusion_dim),
-            nn.Linear(fusion_dim, image_feature_dim),
+
+        fusion_in = image_feature_dim + history_hidden_dim + command_feature_dim
+        if use_depth_token:
+            fusion_in += image_feature_dim
+        if use_segmentation_token:
+            fusion_in += image_feature_dim
+
+        hidden_dim = max(fusion_dim, 256)
+        self.context_mlp = nn.Sequential(
+            nn.Linear(fusion_in, hidden_dim * 2),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim * 2, image_feature_dim),
             nn.ReLU(inplace=True),
             nn.Dropout(dropout),
         )
@@ -207,37 +169,31 @@ class AttentionFusion(nn.Module):
     def forward(
         self,
         *,
+        features: dict[str, torch.Tensor],
         history_features: torch.Tensor,
         command_features: torch.Tensor,
-        visual_tokens: torch.Tensor,
         depth_token: torch.Tensor | None = None,
         segmentation_token: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        history_token = self.history_projection(history_features) + self.history_embedding
-        command_token = self.command_projection(command_features) + self.command_embedding
+        layer3_scale = torch.sigmoid(self.layer3_scale(command_features)).unsqueeze(-1).unsqueeze(-1)
+        layer3_bias = self.layer3_bias(command_features).unsqueeze(-1).unsqueeze(-1)
+        layer4_scale = torch.sigmoid(self.layer4_scale(command_features)).unsqueeze(-1).unsqueeze(-1)
+        layer4_bias = self.layer4_bias(command_features).unsqueeze(-1).unsqueeze(-1)
 
-        token_list = [history_token, command_token]
-        if depth_token is not None:
-            token_list.append(self.depth_projection(depth_token) + self.depth_embedding)
-        if segmentation_token is not None:
-            token_list.append(
-                self.segmentation_projection(segmentation_token)
-                + self.segmentation_embedding
-            )
+        layer3_features = features["layer3"] * layer3_scale + layer3_bias
+        layer4_features = features["layer4"] * layer4_scale + layer4_bias
 
-        tokens = torch.stack(token_list, dim=1)
-        cls_token = self.cls_token.expand(tokens.size(0), -1, -1) + self.cls_embedding
-        tokens = torch.cat([cls_token, tokens, visual_tokens], dim=1)
+        layer3_grid = self.layer3_pool(self.layer3_reduce(layer3_features)).flatten(1)
+        layer4_grid = self.layer4_pool(self.layer4_reduce(layer4_features)).flatten(1)
+        visual_features = self.visual_mlp(torch.cat([layer3_grid, layer4_grid], dim=1))
 
-        attended, _ = self.attention(
-            self.norm1(tokens),
-            self.norm1(tokens),
-            self.norm1(tokens),
-            need_weights=False,
-        )
-        tokens = tokens + attended
-        tokens = tokens + self.feed_forward(self.norm2(tokens))
-        return self.output_projection(tokens[:, 0])
+        fused_features = [visual_features, history_features, command_features]
+        if self.use_depth_token and depth_token is not None:
+            fused_features.append(depth_token)
+        if self.use_segmentation_token and segmentation_token is not None:
+            fused_features.append(segmentation_token)
+
+        return self.context_mlp(torch.cat(fused_features, dim=1))
 
 
 class EgoDrivePlanner(nn.Module):
@@ -263,7 +219,6 @@ class EgoDrivePlanner(nn.Module):
         self.use_segmentation_head = use_segmentation_head
 
         self.backbone = ResNet34Backbone(pretrained=pretrained_backbone)
-        self.visual_tokenizer = SpatialVisualTokenizer(token_dim=fusion_dim)
 
         gru_dropout = dropout if history_layers > 1 else 0.0
         self.history_encoder = nn.GRU(
@@ -274,13 +229,14 @@ class EgoDrivePlanner(nn.Module):
             dropout=gru_dropout,
         )
         self.command_embedding = nn.Embedding(3, command_feature_dim)
-        self.fusion = AttentionFusion(
+        self.fusion = LightweightFusion(
             history_hidden_dim=history_hidden_dim,
             command_feature_dim=command_feature_dim,
             image_feature_dim=image_feature_dim,
             fusion_dim=fusion_dim,
-            num_heads=fusion_heads,
             dropout=dropout,
+            use_depth_token=use_depth_head,
+            use_segmentation_token=use_segmentation_head,
         )
 
         self.trajectory_decoder = nn.Sequential(
@@ -320,7 +276,6 @@ class EgoDrivePlanner(nn.Module):
         command: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
         features = self.backbone(camera)
-        visual_tokens = self.visual_tokenizer(features)
         depth_token = None
         segmentation_token = None
 
@@ -356,9 +311,9 @@ class EgoDrivePlanner(nn.Module):
                 )
 
         fused_features = self.fusion(
+            features=features,
             history_features=history_features,
             command_features=command_features,
-            visual_tokens=visual_tokens,
             depth_token=depth_token,
             segmentation_token=segmentation_token,
         )
