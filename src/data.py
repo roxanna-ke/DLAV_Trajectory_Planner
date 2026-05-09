@@ -5,9 +5,11 @@ from pathlib import Path
 from typing import Iterable
 
 import torch
+import torch.nn.functional as torch_f
 from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
+from torchvision.transforms import InterpolationMode
 
 COMMAND_TO_INDEX = {
     "forward": 0,
@@ -16,14 +18,43 @@ COMMAND_TO_INDEX = {
 }
 
 
-def build_camera_transform(image_size: int = 224) -> transforms.Compose:
+def build_eval_camera_transform(image_size: int = 224) -> transforms.Compose:
     return transforms.Compose(
         [
-            transforms.Resize((image_size, image_size)),
+            transforms.Resize((image_size, image_size), interpolation=InterpolationMode.BILINEAR),
             transforms.ToTensor(),
             transforms.Normalize(
                 mean=[0.485, 0.456, 0.406],
                 std=[0.229, 0.224, 0.225],
+            ),
+        ]
+    )
+
+
+def build_train_camera_transform(image_size: int = 224) -> transforms.Compose:
+    return transforms.Compose(
+        [
+            transforms.Resize((image_size, image_size), interpolation=InterpolationMode.BILINEAR),
+            transforms.ColorJitter(
+                brightness=0.15,
+                contrast=0.15,
+                saturation=0.10,
+                hue=0.03,
+            ),
+            transforms.RandomApply(
+                [transforms.GaussianBlur(kernel_size=5, sigma=(0.1, 1.5))],
+                p=0.20,
+            ),
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225],
+            ),
+            transforms.RandomErasing(
+                p=0.20,
+                scale=(0.02, 0.08),
+                ratio=(0.5, 1.5),
+                value="random", 
             ),
         ]
     )
@@ -43,11 +74,17 @@ class DrivingDataset(Dataset):
         file_list: Iterable[str | Path],
         *,
         test: bool = False,
+        augment: bool = False,
         image_size: int = 224,
     ) -> None:
         self.samples = [Path(path) for path in file_list]
         self.test = test
-        self.camera_transform = build_camera_transform(image_size=image_size)
+        self.image_size = image_size
+        self.camera_transform = (
+            build_eval_camera_transform(image_size=image_size)
+            if test or not augment
+            else build_train_camera_transform(image_size=image_size)
+        )
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -74,5 +111,42 @@ class DrivingDataset(Dataset):
             item["future"] = torch.as_tensor(
                 data["sdc_future_feature"], dtype=torch.float32
             )
+            item["depth"] = self._resize_depth_map(data["depth"])
+            item["semantic_label"] = self._resize_segmentation_map(data["semantic_label"])
 
         return item
+
+    def _resize_depth_map(self, depth_map: object) -> torch.Tensor:
+        depth_tensor = torch.as_tensor(depth_map, dtype=torch.float32)
+        if depth_tensor.ndim == 2:
+            depth_tensor = depth_tensor.unsqueeze(0)
+        elif depth_tensor.ndim == 3:
+            depth_tensor = depth_tensor.permute(2, 0, 1)
+        else:
+            raise ValueError(f"Unsupported depth map shape: {tuple(depth_tensor.shape)}")
+
+        resized = torch_f.interpolate(
+            depth_tensor.unsqueeze(0),
+            size=(self.image_size, self.image_size),
+            mode="bilinear",
+            align_corners=False,
+        )
+        return resized.squeeze(0)
+
+    def _resize_segmentation_map(self, segmentation_map: object) -> torch.Tensor:
+        segmentation_tensor = torch.as_tensor(segmentation_map, dtype=torch.float32)
+        if segmentation_tensor.ndim == 2:
+            segmentation_tensor = segmentation_tensor.unsqueeze(0)
+        elif segmentation_tensor.ndim == 3:
+            segmentation_tensor = segmentation_tensor.permute(2, 0, 1)
+        else:
+            raise ValueError(
+                f"Unsupported segmentation map shape: {tuple(segmentation_tensor.shape)}"
+            )
+
+        resized = torch_f.interpolate(
+            segmentation_tensor.unsqueeze(0),
+            size=(self.image_size, self.image_size),
+            mode="nearest",
+        )
+        return resized.squeeze(0).squeeze(0).long()
