@@ -20,10 +20,10 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--checkpoint",
-        default="outputs/phase1_resnet_gru/best_checkpoint.pt",
+        default="outputs/phase2_resnet34_attention_depth_seg/best_checkpoint.pt",
     )
     parser.add_argument("--test-dir", default="test_public")
-    parser.add_argument("--output-csv", default="submission_phase1.csv")
+    parser.add_argument("--output-csv", default="submission_phase2.csv")
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--image-size", type=int, default=None)
@@ -44,15 +44,18 @@ def load_model(
     )
 
     model = EgoDrivePlanner(
-        backbone_name=config["backbone"],
         pretrained_backbone=False,
         image_feature_dim=config["image_feature_dim"],
-        history_feature_dim=config["history_feature_dim"],
+        history_hidden_dim=config["history_hidden_dim"],
         command_feature_dim=config["command_feature_dim"],
-        gru_hidden_dim=config["gru_hidden_dim"],
-        gru_layers=config["gru_layers"],
+        history_layers=config["history_layers"],
+        fusion_dim=config["fusion_dim"],
+        fusion_heads=config["fusion_heads"],
         dropout=config["dropout"],
         future_steps=config["future_steps"],
+        use_depth_head=config.get("use_depth_head", True),
+        use_segmentation_head=config.get("use_segmentation_head", True),
+        num_segmentation_classes=config["num_segmentation_classes"],
     )
     model.load_state_dict(checkpoint["model_state_dict"])
     model.to(device)
@@ -87,8 +90,8 @@ def main() -> None:
             history = batch["history"].to(device)
             command = batch["command"].to(device)
 
-            future = model(camera, history, command)
-            predictions.append(future[..., :2].cpu().numpy())
+            outputs = model(camera, history, command)
+            predictions.append(outputs["trajectory"][..., :2].cpu().numpy())
             sample_ids.extend(batch["sample_id"].tolist())
 
     all_predictions = np.concatenate(predictions, axis=0)

@@ -2,40 +2,47 @@ from __future__ import annotations
 
 import argparse
 import copy
-from pathlib import Path
 
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from src.data import DrivingDataset, list_pickle_files
-from src.metrics import displacement_errors, trajectory_loss
+from src.metrics import displacement_errors, multitask_loss
 from src.model import EgoDrivePlanner
 from src.utils import ensure_dir, get_device, save_json, set_seed
 
 
 def build_argparser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Train the Milestone 1 planner.")
+    parser = argparse.ArgumentParser(
+        description="Train the depth + segmentation Milestone 2 planner with attention fusion."
+    )
     parser.add_argument("--train-dir", default="train")
     parser.add_argument("--val-dir", default="val")
-    parser.add_argument("--output-dir", default="outputs/phase1_resnet_gru")
-    parser.add_argument("--backbone", default="resnet18", choices=["resnet18", "resnet34"])
+    parser.add_argument(
+        "--output-dir",
+        default="outputs/phase2_resnet34_attention_depth_seg",
+    )
     parser.add_argument("--no-pretrained", action="store_true")
     parser.add_argument("--freeze-backbone", action="store_true")
     parser.add_argument("--image-size", type=int, default=224)
-    parser.add_argument("--image-feature-dim", type=int, default=128)
-    parser.add_argument("--history-feature-dim", type=int, default=64)
-    parser.add_argument("--command-feature-dim", type=int, default=16)
-    parser.add_argument("--gru-hidden-dim", type=int, default=256)
-    parser.add_argument("--gru-layers", type=int, default=2)
+    parser.add_argument("--image-feature-dim", type=int, default=256)
+    parser.add_argument("--history-hidden-dim", type=int, default=128)
+    parser.add_argument("--command-feature-dim", type=int, default=32)
+    parser.add_argument("--history-layers", type=int, default=2)
+    parser.add_argument("--fusion-dim", type=int, default=256)
+    parser.add_argument("--fusion-heads", type=int, default=4)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--future-steps", type=int, default=60)
-    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--num-segmentation-classes", type=int, default=15)
+    parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--num-workers", type=int, default=4)
-    parser.add_argument("--epochs", type=int, default=15)
-    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--heading-weight", type=float, default=0.1)
+    parser.add_argument("--heading-weight", type=float, default=0.05)
+    parser.add_argument("--depth-loss-weight", type=float, default=0.05)
+    parser.add_argument("--segmentation-loss-weight", type=float, default=0.05)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-train-samples", type=int, default=None)
     parser.add_argument("--max-val-samples", type=int, default=None)
@@ -43,7 +50,7 @@ def build_argparser() -> argparse.ArgumentParser:
 
 
 def freeze_backbone_parameters(model: EgoDrivePlanner) -> None:
-    for parameter in model.image_encoder.parameters():
+    for parameter in model.backbone.parameters():
         parameter.requires_grad = False
 
 
@@ -53,9 +60,15 @@ def evaluate(
     *,
     device: torch.device,
     heading_weight: float,
+    depth_loss_weight: float,
+    segmentation_loss_weight: float,
 ) -> dict[str, float]:
     model.eval()
     total_loss = 0.0
+    total_xy_loss = 0.0
+    total_heading_loss = 0.0
+    total_depth_loss = 0.0
+    total_segmentation_loss = 0.0
     total_ade = 0.0
     total_fde = 0.0
     total_samples = 0
@@ -66,21 +79,39 @@ def evaluate(
             history = batch["history"].to(device)
             command = batch["command"].to(device)
             future = batch["future"].to(device)
+            depth = batch["depth"].to(device)
+            semantic_label = batch["semantic_label"].to(device)
 
-            prediction = model(camera, history, command)
-            loss, _ = trajectory_loss(
-                prediction, future, heading_weight=heading_weight
+            outputs = model(camera, history, command)
+            loss, metrics = multitask_loss(
+                outputs["trajectory"],
+                future,
+                outputs.get("depth"),
+                depth,
+                outputs.get("segmentation_logits"),
+                semantic_label,
+                heading_weight=heading_weight,
+                depth_loss_weight=depth_loss_weight,
+                segmentation_loss_weight=segmentation_loss_weight,
             )
-            ade, fde = displacement_errors(prediction, future)
+            ade, fde = displacement_errors(outputs["trajectory"], future)
 
             batch_size = camera.size(0)
             total_samples += batch_size
             total_loss += loss.item() * batch_size
+            total_xy_loss += metrics["xy_loss"] * batch_size
+            total_heading_loss += metrics["heading_loss"] * batch_size
+            total_depth_loss += metrics["depth_loss"] * batch_size
+            total_segmentation_loss += metrics["segmentation_loss"] * batch_size
             total_ade += ade.item() * batch_size
             total_fde += fde.item() * batch_size
 
     return {
         "loss": total_loss / total_samples,
+        "xy_loss": total_xy_loss / total_samples,
+        "heading_loss": total_heading_loss / total_samples,
+        "depth_loss": total_depth_loss / total_samples,
+        "segmentation_loss": total_segmentation_loss / total_samples,
         "ade": total_ade / total_samples,
         "fde": total_fde / total_samples,
     }
@@ -96,8 +127,8 @@ def main() -> None:
     train_files = list_pickle_files(args.train_dir, args.max_train_samples)
     val_files = list_pickle_files(args.val_dir, args.max_val_samples)
 
-    train_dataset = DrivingDataset(train_files, image_size=args.image_size)
-    val_dataset = DrivingDataset(val_files, image_size=args.image_size)
+    train_dataset = DrivingDataset(train_files, augment=True, image_size=args.image_size)
+    val_dataset = DrivingDataset(val_files, augment=False, image_size=args.image_size)
 
     train_loader = DataLoader(
         train_dataset,
@@ -115,15 +146,18 @@ def main() -> None:
     )
 
     model = EgoDrivePlanner(
-        backbone_name=args.backbone,
         pretrained_backbone=not args.no_pretrained,
         image_feature_dim=args.image_feature_dim,
-        history_feature_dim=args.history_feature_dim,
+        history_hidden_dim=args.history_hidden_dim,
         command_feature_dim=args.command_feature_dim,
-        gru_hidden_dim=args.gru_hidden_dim,
-        gru_layers=args.gru_layers,
+        history_layers=args.history_layers,
+        fusion_dim=args.fusion_dim,
+        fusion_heads=args.fusion_heads,
         dropout=args.dropout,
         future_steps=args.future_steps,
+        use_depth_head=True,
+        use_segmentation_head=True,
+        num_segmentation_classes=args.num_segmentation_classes,
     ).to(device)
 
     if args.freeze_backbone:
@@ -135,7 +169,8 @@ def main() -> None:
         weight_decay=args.weight_decay,
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.epochs
+        optimizer,
+        T_max=args.epochs,
     )
 
     best_state = None
@@ -147,6 +182,8 @@ def main() -> None:
         running_loss = 0.0
         running_xy_loss = 0.0
         running_heading_loss = 0.0
+        running_depth_loss = 0.0
+        running_segmentation_loss = 0.0
         total_samples = 0
 
         progress = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs}", leave=False)
@@ -155,15 +192,24 @@ def main() -> None:
             history_batch = batch["history"].to(device)
             command = batch["command"].to(device)
             future = batch["future"].to(device)
+            depth = batch["depth"].to(device)
+            semantic_label = batch["semantic_label"].to(device)
 
             optimizer.zero_grad(set_to_none=True)
-            prediction = model(camera, history_batch, command)
-            loss, loss_metrics = trajectory_loss(
-                prediction,
+            outputs = model(camera, history_batch, command)
+            loss, loss_metrics = multitask_loss(
+                outputs["trajectory"],
                 future,
+                outputs.get("depth"),
+                depth,
+                outputs.get("segmentation_logits"),
+                semantic_label,
                 heading_weight=args.heading_weight,
+                depth_loss_weight=args.depth_loss_weight,
+                segmentation_loss_weight=args.segmentation_loss_weight,
             )
             loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             optimizer.step()
 
             batch_size = camera.size(0)
@@ -171,10 +217,13 @@ def main() -> None:
             running_loss += loss_metrics["loss"] * batch_size
             running_xy_loss += loss_metrics["xy_loss"] * batch_size
             running_heading_loss += loss_metrics["heading_loss"] * batch_size
+            running_depth_loss += loss_metrics["depth_loss"] * batch_size
+            running_segmentation_loss += loss_metrics["segmentation_loss"] * batch_size
             progress.set_postfix(
                 loss=f"{running_loss / total_samples:.4f}",
                 xy=f"{running_xy_loss / total_samples:.4f}",
-                heading=f"{running_heading_loss / total_samples:.4f}",
+                depth=f"{running_depth_loss / total_samples:.4f}",
+                seg=f"{running_segmentation_loss / total_samples:.4f}",
             )
 
         scheduler.step()
@@ -182,19 +231,29 @@ def main() -> None:
             "loss": running_loss / total_samples,
             "xy_loss": running_xy_loss / total_samples,
             "heading_loss": running_heading_loss / total_samples,
+            "depth_loss": running_depth_loss / total_samples,
+            "segmentation_loss": running_segmentation_loss / total_samples,
         }
         val_stats = evaluate(
             model,
             val_loader,
             device=device,
             heading_weight=args.heading_weight,
+            depth_loss_weight=args.depth_loss_weight,
+            segmentation_loss_weight=args.segmentation_loss_weight,
         )
         epoch_summary = {
             "epoch": epoch,
             "train_loss": train_stats["loss"],
             "train_xy_loss": train_stats["xy_loss"],
             "train_heading_loss": train_stats["heading_loss"],
+            "train_depth_loss": train_stats["depth_loss"],
+            "train_segmentation_loss": train_stats["segmentation_loss"],
             "val_loss": val_stats["loss"],
+            "val_xy_loss": val_stats["xy_loss"],
+            "val_heading_loss": val_stats["heading_loss"],
+            "val_depth_loss": val_stats["depth_loss"],
+            "val_segmentation_loss": val_stats["segmentation_loss"],
             "val_ade": val_stats["ade"],
             "val_fde": val_stats["fde"],
             "lr": scheduler.get_last_lr()[0],
@@ -204,7 +263,11 @@ def main() -> None:
         print(
             f"Epoch {epoch:02d} | "
             f"train_loss={train_stats['loss']:.4f} | "
+            f"train_depth={train_stats['depth_loss']:.4f} | "
+            f"train_seg={train_stats['segmentation_loss']:.4f} | "
             f"val_loss={val_stats['loss']:.4f} | "
+            f"val_depth={val_stats['depth_loss']:.4f} | "
+            f"val_seg={val_stats['segmentation_loss']:.4f} | "
             f"val_ADE={val_stats['ade']:.4f} | "
             f"val_FDE={val_stats['fde']:.4f}"
         )
@@ -214,7 +277,11 @@ def main() -> None:
             "optimizer_state_dict": optimizer.state_dict(),
             "epoch": epoch,
             "best_val_ade": best_val_ade,
-            "config": vars(args),
+            "config": vars(args)
+            | {
+                "use_depth_head": True,
+                "use_segmentation_head": True,
+            },
         }
         torch.save(checkpoint, output_dir / "last_checkpoint.pt")
 
@@ -237,6 +304,8 @@ def main() -> None:
             "train_samples": len(train_dataset),
             "val_samples": len(val_dataset),
             "best_epoch": best_state["epoch"],
+            "depth_loss_weight": args.depth_loss_weight,
+            "segmentation_loss_weight": args.segmentation_loss_weight,
         },
     )
     print(f"Best checkpoint saved to {output_dir / 'best_checkpoint.pt'}")
