@@ -345,10 +345,13 @@ def main() -> None:
         loaded_state = checkpoint["model_state_dict"]
         model_state = model.state_dict()
 
-        # Rename legacy keys: vision_encoder -> stem
+        # Rename legacy keys: backbone / vision_encoder -> stem
         renamed_state = {}
         for key, value in loaded_state.items():
-            new_key = key.replace("vision_encoder.", "stem.") if key.startswith("vision_encoder.") else key
+            if key.startswith("backbone.") or key.startswith("vision_encoder."):
+                new_key = "stem." + key.split(".", 1)[1]
+            else:
+                new_key = key
             renamed_state[new_key] = value
         loaded_state = renamed_state
 
