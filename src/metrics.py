@@ -21,8 +21,8 @@ def trajectory_loss(
 ) -> tuple[torch.Tensor, dict[str, float]]:
     prediction_xy = prediction[..., :2].contiguous()
     target_xy = target[..., :2].contiguous()
-    prediction_heading = prediction[..., 2].contiguous()
-    target_heading = target[..., 2].contiguous()
+    prediction_heading = prediction[..., 2:].contiguous()
+    target_heading = target[..., 2:].contiguous()
 
     xy_loss = torch.nn.functional.smooth_l1_loss(
         prediction_xy, target_xy

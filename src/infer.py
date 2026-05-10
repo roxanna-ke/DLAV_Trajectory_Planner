@@ -20,10 +20,10 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--checkpoint",
-        default="outputs/phase2_resnet34_attention_depth_seg/best_checkpoint.pt",
+        default="outputs/hybrid_resnet34_local_fusion/best_checkpoint.pt",
     )
     parser.add_argument("--test-dir", default="test_public")
-    parser.add_argument("--output-csv", default="submission_phase2.csv")
+    parser.add_argument("--output-csv", default="submission_hybrid.csv")
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--image-size", type=int, default=None)
@@ -64,8 +64,10 @@ def load_model(
         fusion_heads=config["fusion_heads"],
         dropout=config["dropout"],
         future_steps=config["future_steps"],
-        use_depth_head=config.get("use_depth_head", True),
-        use_segmentation_head=config.get("use_segmentation_head", True),
+        use_depth_head=config.get("use_depth_head", False),
+        use_segmentation_head=config.get("use_segmentation_head", False),
+        use_depth_token=config.get("use_depth_token", False),
+        use_segmentation_token=config.get("use_segmentation_token", False),
         num_segmentation_classes=config["num_segmentation_classes"],
     )
     model.load_state_dict(checkpoint["model_state_dict"])
@@ -111,9 +113,11 @@ def main() -> None:
             camera = batch["camera"].to(device)
             history = batch["history"].to(device)
             command = batch["command"].to(device)
+            last_pos = batch["last_pos"].to(device)
 
             outputs = model(camera, history, command)
-            predictions.append(outputs["trajectory"][..., :2].cpu().numpy())
+            prediction_xy = outputs["trajectory"][..., :2] + last_pos.unsqueeze(1)
+            predictions.append(prediction_xy.cpu().numpy())
             sample_ids.extend(batch["sample_id"].tolist())
 
     all_predictions = np.concatenate(predictions, axis=0)
