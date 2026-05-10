@@ -123,6 +123,8 @@ class EgoDrivePlanner(nn.Module):
             aux = self.aux_decoder(fmap)                  # (B, 128, h, w)
             aux_feat = self.global_pool(aux).flatten(1)   # (B, 128) — for context fusion
 
+        device = camera.device
+
         # Fusion: concat [vis, hist, cmd, aux_feat] → context vector
         # aux_feat is real when aux heads are active, zeros otherwise (keeps shapes consistent for resume)
         if aux_feat is None:
@@ -131,7 +133,6 @@ class EgoDrivePlanner(nn.Module):
         ctx = self.context_mlp(torch.cat(fusion_parts, dim=1))
 
         # Autoregressive GRU decoder with per-step ctx injection
-        device = camera.device
         h_dec = ctx
         ctx_step = self.ctx_proj(ctx)                      # (B, 4) — projected ctx for each step
         step_input = torch.zeros(B, 4, device=device)
