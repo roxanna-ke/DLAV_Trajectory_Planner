@@ -215,9 +215,9 @@ def evaluate(
             total_fde_loss += metrics["fde_loss"] * batch_size
             total_depth_loss += metrics["depth_loss"] * batch_size
             total_segmentation_loss += metrics["segmentation_loss"] * batch_size
-            total_weighted_depth_loss += float(weighted_depth_loss.detach().item()) * batch_size
+            total_weighted_depth_loss += float(weighted_depth_loss.detach().item() if isinstance(weighted_depth_loss, torch.Tensor) else weighted_depth_loss) * batch_size
             total_weighted_segmentation_loss += (
-                float(weighted_segmentation_loss.detach().item()) * batch_size
+                float(weighted_segmentation_loss.detach().item() if isinstance(weighted_segmentation_loss, torch.Tensor) else weighted_segmentation_loss) * batch_size
             )
             total_ade += ade.item() * batch_size
             total_fde += fde.item() * batch_size
