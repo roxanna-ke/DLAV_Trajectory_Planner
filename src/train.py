@@ -15,13 +15,13 @@ from src.utils import ensure_dir, get_device, save_json, set_seed
 
 def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Train the depth + segmentation Milestone 2 planner with attention fusion."
+        description="Train the hybrid planner with local trajectory targets and multiscale fusion."
     )
     parser.add_argument("--train-dir", default="train")
     parser.add_argument("--val-dir", default="val")
     parser.add_argument(
         "--output-dir",
-        default="outputs/phase2_resnet34_attention_depth_seg",
+        default="outputs/hybrid_resnet34_local_fusion",
     )
     parser.add_argument("--no-pretrained", action="store_true")
     parser.add_argument("--freeze-backbone", action="store_true")
@@ -37,14 +37,19 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--future-steps", type=int, default=60)
     parser.add_argument("--num-segmentation-classes", type=int, default=15)
-    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--use-depth-head", action="store_true")
+    parser.add_argument("--use-segmentation-head", action="store_true")
+    parser.add_argument("--use-depth-token", action="store_true")
+    parser.add_argument("--use-segmentation-token", action="store_true")
+    parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--num-workers", type=int, default=4)
-    parser.add_argument("--epochs", type=int, default=20)
-    parser.add_argument("--lr", type=float, default=2e-4)
+    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--backbone-lr", type=float, default=5e-5)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--heading-weight", type=float, default=0.05)
-    parser.add_argument("--depth-loss-weight", type=float, default=0.05)
-    parser.add_argument("--segmentation-loss-weight", type=float, default=0.05)
+    parser.add_argument("--heading-weight", type=float, default=0.1)
+    parser.add_argument("--depth-loss-weight", type=float, default=0.01)
+    parser.add_argument("--segmentation-loss-weight", type=float, default=0.01)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-train-samples", type=int, default=None)
     parser.add_argument("--max-val-samples", type=int, default=None)
@@ -181,22 +186,40 @@ def main() -> None:
         fusion_heads=args.fusion_heads,
         dropout=args.dropout,
         future_steps=args.future_steps,
-        use_depth_head=True,
-        use_segmentation_head=True,
+        use_depth_head=args.use_depth_head,
+        use_segmentation_head=args.use_segmentation_head,
+        use_depth_token=args.use_depth_token,
+        use_segmentation_token=args.use_segmentation_token,
         num_segmentation_classes=args.num_segmentation_classes,
     ).to(device)
 
     if args.freeze_backbone:
         freeze_backbone_parameters(model)
 
+    backbone_parameters = []
+    head_parameters = []
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        if name.startswith("backbone."):
+            backbone_parameters.append(parameter)
+        else:
+            head_parameters.append(parameter)
+
+    parameter_groups = []
+    if backbone_parameters:
+        parameter_groups.append({"params": backbone_parameters, "lr": args.backbone_lr})
+    if head_parameters:
+        parameter_groups.append({"params": head_parameters, "lr": args.lr})
+
     optimizer = torch.optim.AdamW(
-        filter(lambda parameter: parameter.requires_grad, model.parameters()),
-        lr=args.lr,
+        parameter_groups,
         weight_decay=args.weight_decay,
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
         T_max=args.epochs,
+        eta_min=1e-6,
     )
 
     best_state = None
@@ -283,16 +306,19 @@ def main() -> None:
             "val_segmentation_loss": val_stats["segmentation_loss"],
             "val_ade": val_stats["ade"],
             "val_fde": val_stats["fde"],
-            "lr": scheduler.get_last_lr()[0],
+            "backbone_lr": scheduler.get_last_lr()[0],
+            "head_lr": scheduler.get_last_lr()[-1],
         }
         history.append(epoch_summary)
 
         print(
             f"Epoch {epoch:02d} | "
             f"train_loss={train_stats['loss']:.4f} | "
+            f"train_xy={train_stats['xy_loss']:.4f} | "
             f"train_depth={train_stats['depth_loss']:.4f} | "
             f"train_seg={train_stats['segmentation_loss']:.4f} | "
             f"val_loss={val_stats['loss']:.4f} | "
+            f"val_xy={val_stats['xy_loss']:.4f} | "
             f"val_depth={val_stats['depth_loss']:.4f} | "
             f"val_seg={val_stats['segmentation_loss']:.4f} | "
             f"val_ADE={val_stats['ade']:.4f} | "
@@ -306,8 +332,10 @@ def main() -> None:
             "best_val_ade": best_val_ade,
             "config": vars(args)
             | {
-                "use_depth_head": True,
-                "use_segmentation_head": True,
+                "use_depth_head": args.use_depth_head,
+                "use_segmentation_head": args.use_segmentation_head,
+                "use_depth_token": args.use_depth_token,
+                "use_segmentation_token": args.use_segmentation_token,
             },
         }
         torch.save(checkpoint, output_dir / "last_checkpoint.pt")

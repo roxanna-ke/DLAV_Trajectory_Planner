@@ -211,18 +211,22 @@ class EgoDrivePlanner(nn.Module):
         future_steps: int = 60,
         use_depth_head: bool = True,
         use_segmentation_head: bool = True,
+        use_depth_token: bool = False,
+        use_segmentation_token: bool = False,
         num_segmentation_classes: int = 15,
     ) -> None:
         super().__init__()
         self.future_steps = future_steps
         self.use_depth_head = use_depth_head
         self.use_segmentation_head = use_segmentation_head
+        self.use_depth_token = use_depth_token and use_depth_head
+        self.use_segmentation_token = use_segmentation_token and use_segmentation_head
 
         self.backbone = ResNet34Backbone(pretrained=pretrained_backbone)
 
         gru_dropout = dropout if history_layers > 1 else 0.0
         self.history_encoder = nn.GRU(
-            input_size=3,
+            input_size=4,
             hidden_size=history_hidden_dim,
             num_layers=history_layers,
             batch_first=True,
@@ -235,8 +239,8 @@ class EgoDrivePlanner(nn.Module):
             image_feature_dim=image_feature_dim,
             fusion_dim=fusion_dim,
             dropout=dropout,
-            use_depth_token=use_depth_head,
-            use_segmentation_token=use_segmentation_head,
+            use_depth_token=self.use_depth_token,
+            use_segmentation_token=self.use_segmentation_token,
         )
 
         self.trajectory_decoder = nn.Sequential(
@@ -246,7 +250,7 @@ class EgoDrivePlanner(nn.Module):
             nn.Linear(512, 256),
             nn.ReLU(inplace=True),
             nn.Dropout(dropout),
-            nn.Linear(256, future_steps * 3),
+            nn.Linear(256, future_steps * 4),
         )
 
         self.depth_decoder = DensePredictionDecoder(1) if use_depth_head else None
@@ -257,7 +261,7 @@ class EgoDrivePlanner(nn.Module):
         )
         self.depth_token_encoder = (
             AuxiliaryTokenEncoder(in_channels=33, token_dim=image_feature_dim)
-            if use_depth_head
+            if self.use_depth_token
             else None
         )
         self.segmentation_token_encoder = (
@@ -265,7 +269,7 @@ class EgoDrivePlanner(nn.Module):
                 in_channels=32 + num_segmentation_classes,
                 token_dim=image_feature_dim,
             )
-            if use_segmentation_head
+            if self.use_segmentation_token
             else None
         )
 
@@ -317,9 +321,7 @@ class EgoDrivePlanner(nn.Module):
             depth_token=depth_token,
             segmentation_token=segmentation_token,
         )
-        trajectory_deltas = self.trajectory_decoder(fused_features)
-        trajectory_deltas = trajectory_deltas.view(camera.size(0), self.future_steps, 3)
-        trajectory = torch.cumsum(trajectory_deltas, dim=1)
-
+        trajectory = self.trajectory_decoder(fused_features)
+        trajectory = trajectory.view(camera.size(0), self.future_steps, 4)
         outputs["trajectory"] = trajectory
         return outputs

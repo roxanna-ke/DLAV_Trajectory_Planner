@@ -18,6 +18,12 @@ COMMAND_TO_INDEX = {
 }
 
 
+def encode_pose_sequence(sequence: torch.Tensor, *, origin_xy: torch.Tensor) -> torch.Tensor:
+    xy = sequence[:, :2] - origin_xy
+    heading = sequence[:, 2:3]
+    return torch.cat([xy, torch.sin(heading), torch.cos(heading)], dim=-1)
+
+
 def build_eval_camera_transform(
     image_height: int = 224,
     image_width: int = 336,
@@ -109,19 +115,25 @@ class DrivingDataset(Dataset):
         camera_tensor = self.camera_transform(camera)
 
         command = COMMAND_TO_INDEX[data["driving_command"]]
-        history = torch.as_tensor(data["sdc_history_feature"], dtype=torch.float32)
+        history_raw = torch.as_tensor(data["sdc_history_feature"], dtype=torch.float32)
+        last_pos = history_raw[-1, :2].clone()
+        history = encode_pose_sequence(history_raw, origin_xy=last_pos)
+        if self.augment:
+            history[:, :2] += torch.randn_like(history[:, :2]) * 0.05
 
         item: dict[str, torch.Tensor | int] = {
             "camera": camera_tensor,
             "command": torch.tensor(command, dtype=torch.long),
             "history": history,
+            "last_pos": last_pos,
             "sample_id": int(sample_path.stem),
         }
 
         if not self.test:
-            item["future"] = torch.as_tensor(
+            future_raw = torch.as_tensor(
                 data["sdc_future_feature"], dtype=torch.float32
             )
+            item["future"] = encode_pose_sequence(future_raw, origin_xy=last_pos)
             item["depth"] = self._resize_depth_map(data["depth"])
             item["semantic_label"] = self._resize_segmentation_map(data["semantic_label"])
 
@@ -142,7 +154,7 @@ class DrivingDataset(Dataset):
             mode="bilinear",
             align_corners=False,
         )
-        return resized.squeeze(0)
+        return resized.squeeze(0) / 255.0
 
     def _resize_segmentation_map(self, segmentation_map: object) -> torch.Tensor:
         segmentation_tensor = torch.as_tensor(segmentation_map, dtype=torch.float32)
