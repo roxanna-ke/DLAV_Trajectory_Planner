@@ -4,11 +4,12 @@ import argparse
 import copy
 
 import torch
+import torch.nn.functional as torch_f
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from src.data import DrivingDataset, list_pickle_files
-from src.metrics import displacement_errors, multitask_loss
+from src.metrics import displacement_errors, depth_loss, segmentation_loss
 from src.model import EgoDrivePlanner
 from src.utils import ensure_dir, get_device, save_json, set_seed
 
@@ -48,8 +49,13 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--backbone-lr", type=float, default=5e-5)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--heading-weight", type=float, default=0.1)
+    parser.add_argument("--fde-weight", type=float, default=0.15)
     parser.add_argument("--depth-loss-weight", type=float, default=0.01)
     parser.add_argument("--segmentation-loss-weight", type=float, default=0.01)
+    parser.add_argument("--aux-warmup-epochs", type=int, default=3)
+    parser.add_argument("--aux-ramp-epochs", type=int, default=5)
+    parser.add_argument("--time-weight-start", type=float, default=1.0)
+    parser.add_argument("--time-weight-end", type=float, default=2.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-train-samples", type=int, default=None)
     parser.add_argument("--max-val-samples", type=int, default=None)
@@ -71,12 +77,77 @@ def freeze_backbone_batchnorm(model: EgoDrivePlanner) -> None:
                 module.bias.requires_grad_(False)
 
 
+def build_time_weights(
+    future_steps: int,
+    device: torch.device,
+    *,
+    start: float,
+    end: float,
+) -> torch.Tensor:
+    weights = torch.linspace(start, end, future_steps, device=device)
+    weights = weights.view(1, future_steps, 1)
+    return weights / weights.mean()
+
+
+def compute_aux_scale(
+    epoch: int,
+    *,
+    warmup_epochs: int,
+    ramp_epochs: int,
+) -> float:
+    if epoch <= warmup_epochs:
+        return 0.0
+    if ramp_epochs <= 0:
+        return 1.0
+    progress = (epoch - warmup_epochs) / ramp_epochs
+    return float(max(0.0, min(1.0, progress)))
+
+
+def trajectory_objective(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    time_weights: torch.Tensor,
+    heading_weight: float,
+    fde_weight: float,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    prediction_xy = prediction[..., :2].contiguous()
+    target_xy = target[..., :2].contiguous()
+    prediction_heading = prediction[..., 2:].contiguous()
+    target_heading = target[..., 2:].contiguous()
+
+    xy_residual = torch_f.smooth_l1_loss(
+        prediction_xy,
+        target_xy,
+        reduction="none",
+        beta=1.0,
+    )
+    xy_loss = (xy_residual * time_weights).mean()
+    heading_loss = torch_f.smooth_l1_loss(
+        prediction_heading,
+        target_heading,
+        beta=1.0,
+    )
+    fde_loss = torch.linalg.norm(prediction_xy[:, -1] - target_xy[:, -1], dim=-1).mean()
+
+    total_loss = xy_loss + heading_weight * heading_loss + fde_weight * fde_loss
+    metrics = {
+        "xy_loss": float(xy_loss.detach().item()),
+        "heading_loss": float(heading_loss.detach().item()),
+        "fde_loss": float(fde_loss.detach().item()),
+        "loss": float(total_loss.detach().item()),
+    }
+    return total_loss, metrics
+
+
 def evaluate(
     model: EgoDrivePlanner,
     dataloader: DataLoader,
     *,
     device: torch.device,
+    time_weights: torch.Tensor,
     heading_weight: float,
+    fde_weight: float,
     depth_loss_weight: float,
     segmentation_loss_weight: float,
 ) -> dict[str, float]:
@@ -84,8 +155,11 @@ def evaluate(
     total_loss = 0.0
     total_xy_loss = 0.0
     total_heading_loss = 0.0
+    total_fde_loss = 0.0
     total_depth_loss = 0.0
     total_segmentation_loss = 0.0
+    total_weighted_depth_loss = 0.0
+    total_weighted_segmentation_loss = 0.0
     total_ade = 0.0
     total_fde = 0.0
     total_samples = 0
@@ -100,17 +174,34 @@ def evaluate(
             semantic_label = batch["semantic_label"].to(device)
 
             outputs = model(camera, history, command)
-            loss, metrics = multitask_loss(
+            loss, metrics = trajectory_objective(
                 outputs["trajectory"],
                 future,
-                outputs.get("depth"),
-                depth,
-                outputs.get("segmentation_logits"),
-                semantic_label,
+                time_weights=time_weights,
                 heading_weight=heading_weight,
-                depth_loss_weight=depth_loss_weight,
-                segmentation_loss_weight=segmentation_loss_weight,
+                fde_weight=fde_weight,
             )
+            weighted_depth_loss = 0.0
+            weighted_segmentation_loss = 0.0
+            if outputs.get("depth") is not None:
+                aux_loss, depth_metrics = depth_loss(outputs["depth"], depth)
+                weighted_depth_loss = depth_loss_weight * aux_loss
+                loss = loss + weighted_depth_loss
+                metrics.update(depth_metrics)
+            else:
+                metrics["depth_loss"] = 0.0
+
+            if outputs.get("segmentation_logits") is not None:
+                aux_loss, segmentation_metrics = segmentation_loss(
+                    outputs["segmentation_logits"],
+                    semantic_label,
+                )
+                weighted_segmentation_loss = segmentation_loss_weight * aux_loss
+                loss = loss + weighted_segmentation_loss
+                metrics.update(segmentation_metrics)
+            else:
+                metrics["segmentation_loss"] = 0.0
+
             ade, fde = displacement_errors(outputs["trajectory"], future)
 
             batch_size = camera.size(0)
@@ -118,8 +209,13 @@ def evaluate(
             total_loss += loss.item() * batch_size
             total_xy_loss += metrics["xy_loss"] * batch_size
             total_heading_loss += metrics["heading_loss"] * batch_size
+            total_fde_loss += metrics["fde_loss"] * batch_size
             total_depth_loss += metrics["depth_loss"] * batch_size
             total_segmentation_loss += metrics["segmentation_loss"] * batch_size
+            total_weighted_depth_loss += float(weighted_depth_loss.detach().item()) * batch_size
+            total_weighted_segmentation_loss += (
+                float(weighted_segmentation_loss.detach().item()) * batch_size
+            )
             total_ade += ade.item() * batch_size
             total_fde += fde.item() * batch_size
 
@@ -127,8 +223,11 @@ def evaluate(
         "loss": total_loss / total_samples,
         "xy_loss": total_xy_loss / total_samples,
         "heading_loss": total_heading_loss / total_samples,
+        "fde_loss": total_fde_loss / total_samples,
         "depth_loss": total_depth_loss / total_samples,
         "segmentation_loss": total_segmentation_loss / total_samples,
+        "weighted_depth_loss": total_weighted_depth_loss / total_samples,
+        "weighted_segmentation_loss": total_weighted_segmentation_loss / total_samples,
         "ade": total_ade / total_samples,
         "fde": total_fde / total_samples,
     }
@@ -142,6 +241,12 @@ def main() -> None:
 
     set_seed(args.seed)
     device = get_device()
+    time_weights = build_time_weights(
+        args.future_steps,
+        device,
+        start=args.time_weight_start,
+        end=args.time_weight_end,
+    )
 
     output_dir = ensure_dir(args.output_dir)
 
@@ -229,11 +334,25 @@ def main() -> None:
     for epoch in range(1, args.epochs + 1):
         model.train()
         freeze_backbone_batchnorm(model)
+        aux_scale = compute_aux_scale(
+            epoch,
+            warmup_epochs=args.aux_warmup_epochs,
+            ramp_epochs=args.aux_ramp_epochs,
+        )
+        effective_depth_weight = (
+            args.depth_loss_weight * aux_scale if args.use_depth_head else 0.0
+        )
+        effective_segmentation_weight = (
+            args.segmentation_loss_weight * aux_scale if args.use_segmentation_head else 0.0
+        )
         running_loss = 0.0
         running_xy_loss = 0.0
         running_heading_loss = 0.0
+        running_fde_loss = 0.0
         running_depth_loss = 0.0
         running_segmentation_loss = 0.0
+        running_weighted_depth_loss = 0.0
+        running_weighted_segmentation_loss = 0.0
         total_samples = 0
 
         progress = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs}", leave=False)
@@ -247,17 +366,35 @@ def main() -> None:
 
             optimizer.zero_grad(set_to_none=True)
             outputs = model(camera, history_batch, command)
-            loss, loss_metrics = multitask_loss(
+            loss, loss_metrics = trajectory_objective(
                 outputs["trajectory"],
                 future,
-                outputs.get("depth"),
-                depth,
-                outputs.get("segmentation_logits"),
-                semantic_label,
+                time_weights=time_weights,
                 heading_weight=args.heading_weight,
-                depth_loss_weight=args.depth_loss_weight,
-                segmentation_loss_weight=args.segmentation_loss_weight,
+                fde_weight=args.fde_weight,
             )
+            weighted_depth_loss = torch.tensor(0.0, device=device)
+            weighted_segmentation_loss = torch.tensor(0.0, device=device)
+            if outputs.get("depth") is not None:
+                aux_loss, depth_metrics = depth_loss(outputs["depth"], depth)
+                weighted_depth_loss = effective_depth_weight * aux_loss
+                loss = loss + weighted_depth_loss
+                loss_metrics.update(depth_metrics)
+            else:
+                loss_metrics["depth_loss"] = 0.0
+
+            if outputs.get("segmentation_logits") is not None:
+                aux_loss, segmentation_metrics = segmentation_loss(
+                    outputs["segmentation_logits"],
+                    semantic_label,
+                )
+                weighted_segmentation_loss = effective_segmentation_weight * aux_loss
+                loss = loss + weighted_segmentation_loss
+                loss_metrics.update(segmentation_metrics)
+            else:
+                loss_metrics["segmentation_loss"] = 0.0
+
+            loss_metrics["loss"] = float(loss.detach().item())
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             optimizer.step()
@@ -267,13 +404,19 @@ def main() -> None:
             running_loss += loss_metrics["loss"] * batch_size
             running_xy_loss += loss_metrics["xy_loss"] * batch_size
             running_heading_loss += loss_metrics["heading_loss"] * batch_size
+            running_fde_loss += loss_metrics["fde_loss"] * batch_size
             running_depth_loss += loss_metrics["depth_loss"] * batch_size
             running_segmentation_loss += loss_metrics["segmentation_loss"] * batch_size
+            running_weighted_depth_loss += float(weighted_depth_loss.detach().item()) * batch_size
+            running_weighted_segmentation_loss += (
+                float(weighted_segmentation_loss.detach().item()) * batch_size
+            )
             progress.set_postfix(
                 loss=f"{running_loss / total_samples:.4f}",
                 xy=f"{running_xy_loss / total_samples:.4f}",
-                depth=f"{running_depth_loss / total_samples:.4f}",
-                seg=f"{running_segmentation_loss / total_samples:.4f}",
+                fde=f"{running_fde_loss / total_samples:.4f}",
+                auxd=f"{running_weighted_depth_loss / total_samples:.4f}",
+                auxs=f"{running_weighted_segmentation_loss / total_samples:.4f}",
             )
 
         scheduler.step()
@@ -281,29 +424,41 @@ def main() -> None:
             "loss": running_loss / total_samples,
             "xy_loss": running_xy_loss / total_samples,
             "heading_loss": running_heading_loss / total_samples,
+            "fde_loss": running_fde_loss / total_samples,
             "depth_loss": running_depth_loss / total_samples,
             "segmentation_loss": running_segmentation_loss / total_samples,
+            "weighted_depth_loss": running_weighted_depth_loss / total_samples,
+            "weighted_segmentation_loss": running_weighted_segmentation_loss / total_samples,
         }
         val_stats = evaluate(
             model,
             val_loader,
             device=device,
+            time_weights=time_weights,
             heading_weight=args.heading_weight,
-            depth_loss_weight=args.depth_loss_weight,
-            segmentation_loss_weight=args.segmentation_loss_weight,
+            fde_weight=args.fde_weight,
+            depth_loss_weight=effective_depth_weight,
+            segmentation_loss_weight=effective_segmentation_weight,
         )
         epoch_summary = {
             "epoch": epoch,
+            "aux_scale": aux_scale,
             "train_loss": train_stats["loss"],
             "train_xy_loss": train_stats["xy_loss"],
             "train_heading_loss": train_stats["heading_loss"],
+            "train_fde_loss": train_stats["fde_loss"],
             "train_depth_loss": train_stats["depth_loss"],
             "train_segmentation_loss": train_stats["segmentation_loss"],
+            "train_weighted_depth_loss": train_stats["weighted_depth_loss"],
+            "train_weighted_segmentation_loss": train_stats["weighted_segmentation_loss"],
             "val_loss": val_stats["loss"],
             "val_xy_loss": val_stats["xy_loss"],
             "val_heading_loss": val_stats["heading_loss"],
+            "val_fde_loss": val_stats["fde_loss"],
             "val_depth_loss": val_stats["depth_loss"],
             "val_segmentation_loss": val_stats["segmentation_loss"],
+            "val_weighted_depth_loss": val_stats["weighted_depth_loss"],
+            "val_weighted_segmentation_loss": val_stats["weighted_segmentation_loss"],
             "val_ade": val_stats["ade"],
             "val_fde": val_stats["fde"],
             "backbone_lr": scheduler.get_last_lr()[0],
@@ -315,12 +470,15 @@ def main() -> None:
             f"Epoch {epoch:02d} | "
             f"train_loss={train_stats['loss']:.4f} | "
             f"train_xy={train_stats['xy_loss']:.4f} | "
-            f"train_depth={train_stats['depth_loss']:.4f} | "
-            f"train_seg={train_stats['segmentation_loss']:.4f} | "
+            f"train_fde={train_stats['fde_loss']:.4f} | "
+            f"train_auxd={train_stats['weighted_depth_loss']:.4f} | "
+            f"train_auxs={train_stats['weighted_segmentation_loss']:.4f} | "
             f"val_loss={val_stats['loss']:.4f} | "
             f"val_xy={val_stats['xy_loss']:.4f} | "
-            f"val_depth={val_stats['depth_loss']:.4f} | "
-            f"val_seg={val_stats['segmentation_loss']:.4f} | "
+            f"val_fde_loss={val_stats['fde_loss']:.4f} | "
+            f"val_auxd={val_stats['weighted_depth_loss']:.4f} | "
+            f"val_auxs={val_stats['weighted_segmentation_loss']:.4f} | "
+            f"aux_scale={aux_scale:.2f} | "
             f"val_ADE={val_stats['ade']:.4f} | "
             f"val_FDE={val_stats['fde']:.4f}"
         )
@@ -359,8 +517,11 @@ def main() -> None:
             "train_samples": len(train_dataset),
             "val_samples": len(val_dataset),
             "best_epoch": best_state["epoch"],
+            "fde_weight": args.fde_weight,
             "depth_loss_weight": args.depth_loss_weight,
             "segmentation_loss_weight": args.segmentation_loss_weight,
+            "aux_warmup_epochs": args.aux_warmup_epochs,
+            "aux_ramp_epochs": args.aux_ramp_epochs,
         },
     )
     print(f"Best checkpoint saved to {output_dir / 'best_checkpoint.pt'}")
