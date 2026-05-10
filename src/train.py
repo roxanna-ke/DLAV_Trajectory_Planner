@@ -18,8 +18,8 @@ def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Train the hybrid planner with local trajectory targets and multiscale fusion."
     )
-    parser.add_argument("--train-dir", default="train")
-    parser.add_argument("--val-dir", default="val")
+    parser.add_argument("--train-dir", default="~/data/DLAV/train")
+    parser.add_argument("--val-dir", default="~/data/DLAV/val")
     parser.add_argument(
         "--output-dir",
         default="outputs/hybrid_resnet34_local_fusion",
@@ -31,7 +31,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--image-width", type=int, default=336)
     parser.add_argument("--image-feature-dim", type=int, default=256)
     parser.add_argument("--history-hidden-dim", type=int, default=128)
-    parser.add_argument("--command-feature-dim", type=int, default=32)
+    parser.add_argument("--command-feature-dim", type=int, default=64)
     parser.add_argument("--history-layers", type=int, default=2)
     parser.add_argument("--fusion-dim", type=int, default=256)
     parser.add_argument("--fusion-heads", type=int, default=4)
@@ -40,8 +40,6 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--num-segmentation-classes", type=int, default=15)
     parser.add_argument("--use-depth-head", action="store_true")
     parser.add_argument("--use-segmentation-head", action="store_true")
-    parser.add_argument("--use-depth-token", action="store_true")
-    parser.add_argument("--use-segmentation-token", action="store_true")
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--epochs", type=int, default=50)
@@ -68,12 +66,12 @@ def build_argparser() -> argparse.ArgumentParser:
 
 
 def freeze_backbone_parameters(model: EgoDrivePlanner) -> None:
-    for parameter in model.vision_encoder.parameters():
+    for parameter in model.stem.parameters():
         parameter.requires_grad = False
 
 
 def freeze_backbone_batchnorm(model: EgoDrivePlanner) -> None:
-    for module in model.vision_encoder.modules():
+    for module in model.stem.modules():
         if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
             module.eval()
             if module.weight is not None:
@@ -298,8 +296,6 @@ def main() -> None:
         future_steps=args.future_steps,
         use_depth_head=args.use_depth_head,
         use_segmentation_head=args.use_segmentation_head,
-        use_depth_token=args.use_depth_token,
-        use_segmentation_token=args.use_segmentation_token,
         num_segmentation_classes=args.num_segmentation_classes,
     ).to(device)
 
@@ -311,7 +307,7 @@ def main() -> None:
     for name, parameter in model.named_parameters():
         if not parameter.requires_grad:
             continue
-        if name.startswith("vision_encoder."):
+        if name.startswith("stem."):
             backbone_parameters.append(parameter)
         else:
             head_parameters.append(parameter)
@@ -349,7 +345,14 @@ def main() -> None:
         loaded_state = checkpoint["model_state_dict"]
         model_state = model.state_dict()
 
-        # Filter out keys with shape mismatches (e.g. context_mlp when adding tokens)
+        # Rename legacy keys: vision_encoder -> stem
+        renamed_state = {}
+        for key, value in loaded_state.items():
+            new_key = key.replace("vision_encoder.", "stem.") if key.startswith("vision_encoder.") else key
+            renamed_state[new_key] = value
+        loaded_state = renamed_state
+
+        # Filter out keys with shape mismatches
         filtered_state = {}
         skipped_keys = []
         for key, value in loaded_state.items():
@@ -384,7 +387,8 @@ def main() -> None:
 
     for epoch in range(start_epoch, args.epochs + 1):
         model.train()
-        freeze_backbone_batchnorm(model)
+        if args.freeze_backbone:
+            freeze_backbone_batchnorm(model)
         aux_scale = compute_aux_scale(
             epoch,
             warmup_epochs=args.aux_warmup_epochs,
@@ -543,8 +547,6 @@ def main() -> None:
             | {
                 "use_depth_head": args.use_depth_head,
                 "use_segmentation_head": args.use_segmentation_head,
-                "use_depth_token": args.use_depth_token,
-                "use_segmentation_token": args.use_segmentation_token,
             },
         }
         torch.save(checkpoint, output_dir / "last_checkpoint.pt")
