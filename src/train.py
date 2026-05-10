@@ -31,7 +31,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--image-width", type=int, default=336)
     parser.add_argument("--image-feature-dim", type=int, default=256)
     parser.add_argument("--history-hidden-dim", type=int, default=128)
-    parser.add_argument("--command-feature-dim", type=int, default=64)
+    parser.add_argument("--command-feature-dim", type=int, default=32)
     parser.add_argument("--history-layers", type=int, default=2)
     parser.add_argument("--fusion-dim", type=int, default=256)
     parser.add_argument("--fusion-heads", type=int, default=4)
