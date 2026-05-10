@@ -54,8 +54,8 @@ class EgoDrivePlanner(nn.Module):
         self.film_scale = nn.Linear(command_feature_dim, self.vision_dim)
         self.film_bias = nn.Linear(command_feature_dim, self.vision_dim)
 
-        # Auxiliary feature dimension (pooled from aux_decoder when active)
-        self.aux_feat_dim = 128 if (use_depth_head or use_segmentation_head) else 0
+        # Auxiliary feature dimension (always 128; zeros when aux heads are off, so shapes stay consistent across baseline ↔ aux resume)
+        self.aux_feat_dim = 128
 
         # Fusion MLP: concat [vis, hist, cmd, aux_feat] → context
         fusion_in = self.vision_dim + history_hidden_dim + command_feature_dim + self.aux_feat_dim
@@ -124,9 +124,10 @@ class EgoDrivePlanner(nn.Module):
             aux_feat = self.global_pool(aux).flatten(1)   # (B, 128) — for context fusion
 
         # Fusion: concat [vis, hist, cmd, aux_feat] → context vector
-        fusion_parts = [vis, history_features, command_features]
-        if aux_feat is not None:
-            fusion_parts.append(aux_feat)
+        # aux_feat is real when aux heads are active, zeros otherwise (keeps shapes consistent for resume)
+        if aux_feat is None:
+            aux_feat = torch.zeros(B, self.aux_feat_dim, device=device)
+        fusion_parts = [vis, history_features, command_features, aux_feat]
         ctx = self.context_mlp(torch.cat(fusion_parts, dim=1))
 
         # Autoregressive GRU decoder with per-step ctx injection
