@@ -117,10 +117,13 @@ class EgoDrivePlanner(nn.Module):
         history_features = history_hidden[-1]
 
         # Auxiliary decoder: shared features for planner context + aux heads
+        # Detach fmap before aux_decoder so aux gradients don't disrupt the
+        # already-trained stem.  Aux heads still learn to decode stem features,
+        # and aux_feat (pooled from aux) still conditions the planner.
         aux = None
         aux_feat = None
         if self.aux_decoder is not None and (self.depth_head is not None or self.semantic_head is not None):
-            aux = self.aux_decoder(fmap)                  # (B, 128, h, w)
+            aux = self.aux_decoder(fmap.detach())          # (B, 128, h, w)
             aux_feat = self.global_pool(aux).flatten(1)   # (B, 128) — for context fusion
 
         device = camera.device
