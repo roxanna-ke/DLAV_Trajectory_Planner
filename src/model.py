@@ -54,11 +54,10 @@ class EgoDrivePlanner(nn.Module):
         self.film_scale = nn.Linear(command_feature_dim, self.vision_dim)
         self.film_bias = nn.Linear(command_feature_dim, self.vision_dim)
 
-        # Auxiliary feature dimension (always 128; zeros when aux heads are off, so shapes stay consistent across baseline ↔ aux resume)
-        self.aux_feat_dim = 128
-
-        # Fusion MLP: concat [vis, hist, cmd, aux_feat] → context
-        fusion_in = self.vision_dim + history_hidden_dim + command_feature_dim + self.aux_feat_dim
+        # Fusion MLP: concat [vis, hist, cmd] → context
+        # Aux features are NOT injected into the planner — they only regularize
+        # the stem via their loss gradients (proven effective in aux_from_baseline).
+        fusion_in = self.vision_dim + history_hidden_dim + command_feature_dim
         self.context_mlp = nn.Sequential(
             nn.Linear(fusion_in, 512),
             nn.ReLU(inplace=True),
@@ -99,8 +98,6 @@ class EgoDrivePlanner(nn.Module):
         camera: torch.Tensor,
         history: torch.Tensor,
         command: torch.Tensor,
-        *,
-        aux_scale: float = 1.0,
     ) -> dict[str, torch.Tensor]:
         B, _, H, W = camera.shape
 
@@ -118,26 +115,16 @@ class EgoDrivePlanner(nn.Module):
         _, history_hidden = self.history_encoder(history)
         history_features = history_hidden[-1]
 
-        # Auxiliary decoder: shared features for planner context + aux heads
-        # Detach fmap before aux_decoder so aux gradients don't disrupt the
-        # already-trained stem.  Aux heads still learn to decode stem features,
-        # and aux_feat (pooled from aux) still conditions the planner.
+        # Auxiliary decoder: aux heads only — gradients flow back to stem for
+        # regularization (the mechanism that made aux_from_baseline successful).
         aux = None
-        aux_feat = None
         if self.aux_decoder is not None and (self.depth_head is not None or self.semantic_head is not None):
-            aux = self.aux_decoder(fmap.detach())          # (B, 128, h, w)
-            raw_aux_feat = self.global_pool(aux).flatten(1)   # (B, 128) — for context fusion
-            # Blend with zeros based on aux_scale: at scale=0 behaviour matches
-            # baseline exactly (aux_feat=zeros); at scale=1 fully active.
-            aux_feat = raw_aux_feat * aux_scale
+            aux = self.aux_decoder(fmap)          # (B, 128, h, w) — NO detach
 
         device = camera.device
 
-        # Fusion: concat [vis, hist, cmd, aux_feat] → context vector
-        # aux_feat is real when aux heads are active, zeros otherwise (keeps shapes consistent for resume)
-        if aux_feat is None:
-            aux_feat = torch.zeros(B, self.aux_feat_dim, device=device)
-        fusion_parts = [vis, history_features, command_features, aux_feat]
+        # Fusion: concat [vis, hist, cmd] → context vector
+        fusion_parts = [vis, history_features, command_features]
         ctx = self.context_mlp(torch.cat(fusion_parts, dim=1))
 
         # Autoregressive GRU decoder with per-step ctx injection
