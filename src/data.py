@@ -154,7 +154,7 @@ class DrivingDataset(Dataset):
             mode="bilinear",
             align_corners=False,
         )
-        return resized.squeeze(0) / 255.0
+        return torch.log1p(resized.squeeze(0)) / torch.log1p(torch.tensor(255.0))
 
     def _resize_segmentation_map(self, segmentation_map: object) -> torch.Tensor:
         segmentation_tensor = torch.as_tensor(segmentation_map, dtype=torch.float32)

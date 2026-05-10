@@ -43,7 +43,7 @@ def depth_loss(
     prediction: torch.Tensor,
     target: torch.Tensor,
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    loss = torch.nn.functional.l1_loss(prediction.contiguous(), target.contiguous())
+    loss = torch.nn.functional.smooth_l1_loss(prediction.contiguous(), target.contiguous())
     metrics = {"depth_loss": float(loss.detach().item())}
     return loss, metrics
 
@@ -52,9 +52,11 @@ def segmentation_loss(
     prediction: torch.Tensor,
     target: torch.Tensor,
 ) -> tuple[torch.Tensor, dict[str, float]]:
+    target_safe = target.clamp(max=14).contiguous()
     loss = torch.nn.functional.cross_entropy(
         prediction.contiguous(),
-        target.contiguous(),
+        target_safe,
+        ignore_index=255,
     )
     metrics = {"segmentation_loss": float(loss.detach().item())}
     return loss, metrics
