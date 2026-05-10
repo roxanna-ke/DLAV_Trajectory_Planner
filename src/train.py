@@ -153,6 +153,7 @@ def evaluate(
     fde_weight: float,
     depth_loss_weight: float,
     segmentation_loss_weight: float,
+    aux_scale: float = 1.0,
 ) -> dict[str, float]:
     model.eval()
     total_loss = 0.0
@@ -176,7 +177,7 @@ def evaluate(
             depth = batch["depth"].to(device)
             semantic_label = batch["semantic_label"].to(device)
 
-            outputs = model(camera, history, command)
+            outputs = model(camera, history, command, aux_scale=aux_scale)
             loss, metrics = trajectory_objective(
                 outputs["trajectory"],
                 future,
@@ -423,7 +424,7 @@ def main() -> None:
             semantic_label = batch["semantic_label"].to(device)
 
             optimizer.zero_grad(set_to_none=True)
-            outputs = model(camera, history_batch, command)
+            outputs = model(camera, history_batch, command, aux_scale=aux_scale)
             loss, loss_metrics = trajectory_objective(
                 outputs["trajectory"],
                 future,
@@ -497,6 +498,7 @@ def main() -> None:
             fde_weight=args.fde_weight,
             depth_loss_weight=effective_depth_weight,
             segmentation_loss_weight=effective_segmentation_weight,
+            aux_scale=aux_scale,
         )
         epoch_summary = {
             "epoch": epoch,

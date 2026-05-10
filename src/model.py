@@ -99,6 +99,8 @@ class EgoDrivePlanner(nn.Module):
         camera: torch.Tensor,
         history: torch.Tensor,
         command: torch.Tensor,
+        *,
+        aux_scale: float = 1.0,
     ) -> dict[str, torch.Tensor]:
         B, _, H, W = camera.shape
 
@@ -124,7 +126,10 @@ class EgoDrivePlanner(nn.Module):
         aux_feat = None
         if self.aux_decoder is not None and (self.depth_head is not None or self.semantic_head is not None):
             aux = self.aux_decoder(fmap.detach())          # (B, 128, h, w)
-            aux_feat = self.global_pool(aux).flatten(1)   # (B, 128) — for context fusion
+            raw_aux_feat = self.global_pool(aux).flatten(1)   # (B, 128) — for context fusion
+            # Blend with zeros based on aux_scale: at scale=0 behaviour matches
+            # baseline exactly (aux_feat=zeros); at scale=1 fully active.
+            aux_feat = raw_aux_feat * aux_scale
 
         device = camera.device
 
