@@ -69,7 +69,7 @@ def build_train_camera_transform(
 
 
 def list_pickle_files(data_dir: str | Path, limit: int | None = None) -> list[Path]:
-    root = Path(data_dir)
+    root = Path(data_dir).expanduser()
     files = sorted(root.glob("*.pkl"), key=lambda path: int(path.stem))
     if limit is not None:
         files = files[:limit]

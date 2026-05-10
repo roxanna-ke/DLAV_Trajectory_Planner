@@ -66,8 +66,6 @@ def load_model(
         future_steps=config["future_steps"],
         use_depth_head=config.get("use_depth_head", False),
         use_segmentation_head=config.get("use_segmentation_head", False),
-        use_depth_token=config.get("use_depth_token", False),
-        use_segmentation_token=config.get("use_segmentation_token", False),
         num_segmentation_classes=config["num_segmentation_classes"],
     )
     model.load_state_dict(checkpoint["model_state_dict"])
