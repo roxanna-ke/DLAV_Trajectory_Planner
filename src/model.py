@@ -54,8 +54,11 @@ class EgoDrivePlanner(nn.Module):
         self.film_scale = nn.Linear(command_feature_dim, self.vision_dim)
         self.film_bias = nn.Linear(command_feature_dim, self.vision_dim)
 
-        # Fusion MLP: concat [vis, hist, cmd] → context
-        fusion_in = self.vision_dim + history_hidden_dim + command_feature_dim
+        # Auxiliary feature dimension (pooled from aux_decoder when active)
+        self.aux_feat_dim = 128 if (use_depth_head or use_segmentation_head) else 0
+
+        # Fusion MLP: concat [vis, hist, cmd, aux_feat] → context
+        fusion_in = self.vision_dim + history_hidden_dim + command_feature_dim + self.aux_feat_dim
         self.context_mlp = nn.Sequential(
             nn.Linear(fusion_in, 512),
             nn.ReLU(inplace=True),
@@ -64,9 +67,10 @@ class EgoDrivePlanner(nn.Module):
             nn.ReLU(inplace=True),
         )
 
-        # Autoregressive GRU decoder
+        # Autoregressive GRU decoder (ctx injected at every step)
+        self.ctx_proj = nn.Linear(image_feature_dim, 4)
         self.trajectory_decoder_cell = nn.GRUCell(
-            input_size=4, hidden_size=image_feature_dim,
+            input_size=8, hidden_size=image_feature_dim,  # 4 (step) + 4 (ctx_proj)
         )
         self.trajectory_output_head = nn.Linear(image_feature_dim, 4)
 
@@ -112,16 +116,28 @@ class EgoDrivePlanner(nn.Module):
         _, history_hidden = self.history_encoder(history)
         history_features = history_hidden[-1]
 
-        # Fusion: concat [vis, hist, cmd] → context vector
-        ctx = self.context_mlp(torch.cat([vis, history_features, command_features], dim=1))
+        # Auxiliary decoder: shared features for planner context + aux heads
+        aux = None
+        aux_feat = None
+        if self.aux_decoder is not None and (self.depth_head is not None or self.semantic_head is not None):
+            aux = self.aux_decoder(fmap)                  # (B, 128, h, w)
+            aux_feat = self.global_pool(aux).flatten(1)   # (B, 128) — for context fusion
 
-        # Autoregressive GRU decoder
+        # Fusion: concat [vis, hist, cmd, aux_feat] → context vector
+        fusion_parts = [vis, history_features, command_features]
+        if aux_feat is not None:
+            fusion_parts.append(aux_feat)
+        ctx = self.context_mlp(torch.cat(fusion_parts, dim=1))
+
+        # Autoregressive GRU decoder with per-step ctx injection
         device = camera.device
         h_dec = ctx
+        ctx_step = self.ctx_proj(ctx)                      # (B, 4) — projected ctx for each step
         step_input = torch.zeros(B, 4, device=device)
         step_outputs = []
         for _ in range(self.future_steps):
-            h_dec = self.trajectory_decoder_cell(step_input, h_dec)
+            gru_input = torch.cat([step_input, ctx_step], dim=1)  # (B, 8)
+            h_dec = self.trajectory_decoder_cell(gru_input, h_dec)
             step_out = self.trajectory_output_head(h_dec)
             step_outputs.append(step_out)
             step_input = step_out
@@ -137,10 +153,8 @@ class EgoDrivePlanner(nn.Module):
 
         outputs: dict[str, torch.Tensor] = {"trajectory": trajectory}
 
-        # Auxiliary heads: shared feature map → lightweight decoder → upsample
-        # Gradients flow back to stem, which is the key mechanism for aux to help planning
-        if self.aux_decoder is not None and (self.depth_head is not None or self.semantic_head is not None):
-            aux = self.aux_decoder(fmap)                  # (B, 128, h, w)
+        # Auxiliary heads: reuse aux features computed above
+        if aux is not None:
             if self.semantic_head is not None:
                 semantic_logits = self.semantic_head(aux)  # (B, C, h, w)
                 semantic_logits = torch_f.interpolate(
@@ -152,7 +166,7 @@ class EgoDrivePlanner(nn.Module):
                 depth_pred = torch_f.interpolate(
                     depth_pred, size=(H, W), mode="bilinear", align_corners=False,
                 )
-                depth_pred = torch.sigmoid(depth_pred)
+                # No sigmoid — directly regress log1p-normalized depth target
                 outputs["depth"] = depth_pred
 
         return outputs
