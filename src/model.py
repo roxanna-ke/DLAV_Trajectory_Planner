@@ -6,34 +6,6 @@ import torch.nn.functional as torch_f
 from torchvision.models import ResNet34_Weights, resnet34
 
 
-class ResNet34Backbone(nn.Module):
-    def __init__(self, pretrained: bool) -> None:
-        super().__init__()
-        weights = ResNet34_Weights.DEFAULT if pretrained else None
-        backbone = resnet34(weights=weights)
-        self.stem = nn.Sequential(backbone.conv1, backbone.bn1, backbone.relu)
-        self.maxpool = backbone.maxpool
-        self.layer1 = backbone.layer1
-        self.layer2 = backbone.layer2
-        self.layer3 = backbone.layer3
-        self.layer4 = backbone.layer4
-
-    def forward(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
-        stem = self.stem(x)
-        x = self.maxpool(stem)
-        layer1 = self.layer1(x)
-        layer2 = self.layer2(layer1)
-        layer3 = self.layer3(layer2)
-        layer4 = self.layer4(layer3)
-        return {
-            "stem": stem,
-            "layer1": layer1,
-            "layer2": layer2,
-            "layer3": layer3,
-            "layer4": layer4,
-        }
-
-
 class ConvBlock(nn.Module):
     def __init__(self, in_channels: int, out_channels: int) -> None:
         super().__init__()
@@ -115,87 +87,6 @@ class AuxiliaryTokenEncoder(nn.Module):
         return self.projection(x)
 
 
-class LightweightFusion(nn.Module):
-    def __init__(
-        self,
-        *,
-        history_hidden_dim: int,
-        command_feature_dim: int,
-        image_feature_dim: int,
-        fusion_dim: int,
-        dropout: float,
-        use_depth_token: bool,
-        use_segmentation_token: bool,
-    ) -> None:
-        super().__init__()
-        self.use_depth_token = use_depth_token
-        self.use_segmentation_token = use_segmentation_token
-
-        self.layer3_scale = nn.Linear(command_feature_dim, 256)
-        self.layer3_bias = nn.Linear(command_feature_dim, 256)
-        self.layer4_scale = nn.Linear(command_feature_dim, 512)
-        self.layer4_bias = nn.Linear(command_feature_dim, 512)
-
-        self.layer3_reduce = nn.Conv2d(256, 32, kernel_size=1, bias=False)
-        self.layer4_reduce = nn.Conv2d(512, 64, kernel_size=1, bias=False)
-        self.layer3_pool = nn.AdaptiveAvgPool2d((4, 6))
-        self.layer4_pool = nn.AdaptiveAvgPool2d((2, 3))
-
-        visual_dim = 32 * 4 * 6 + 64 * 2 * 3
-        self.visual_mlp = nn.Sequential(
-            nn.Linear(visual_dim, 512),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-            nn.Linear(512, image_feature_dim),
-            nn.ReLU(inplace=True),
-        )
-
-        fusion_in = image_feature_dim + history_hidden_dim + command_feature_dim
-        if use_depth_token:
-            fusion_in += image_feature_dim
-        if use_segmentation_token:
-            fusion_in += image_feature_dim
-
-        hidden_dim = max(fusion_dim, 256)
-        self.context_mlp = nn.Sequential(
-            nn.Linear(fusion_in, hidden_dim * 2),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim * 2, image_feature_dim),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-        )
-
-    def forward(
-        self,
-        *,
-        features: dict[str, torch.Tensor],
-        history_features: torch.Tensor,
-        command_features: torch.Tensor,
-        depth_token: torch.Tensor | None = None,
-        segmentation_token: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        layer3_scale = torch.sigmoid(self.layer3_scale(command_features)).unsqueeze(-1).unsqueeze(-1)
-        layer3_bias = self.layer3_bias(command_features).unsqueeze(-1).unsqueeze(-1)
-        layer4_scale = torch.sigmoid(self.layer4_scale(command_features)).unsqueeze(-1).unsqueeze(-1)
-        layer4_bias = self.layer4_bias(command_features).unsqueeze(-1).unsqueeze(-1)
-
-        layer3_features = features["layer3"] * layer3_scale + layer3_bias
-        layer4_features = features["layer4"] * layer4_scale + layer4_bias
-
-        layer3_grid = self.layer3_pool(self.layer3_reduce(layer3_features)).flatten(1)
-        layer4_grid = self.layer4_pool(self.layer4_reduce(layer4_features)).flatten(1)
-        visual_features = self.visual_mlp(torch.cat([layer3_grid, layer4_grid], dim=1))
-
-        fused_features = [visual_features, history_features, command_features]
-        if self.use_depth_token and depth_token is not None:
-            fused_features.append(depth_token)
-        if self.use_segmentation_token and segmentation_token is not None:
-            fused_features.append(segmentation_token)
-
-        return self.context_mlp(torch.cat(fused_features, dim=1))
-
-
 class EgoDrivePlanner(nn.Module):
     def __init__(
         self,
@@ -222,8 +113,13 @@ class EgoDrivePlanner(nn.Module):
         self.use_depth_token = use_depth_token and use_depth_head
         self.use_segmentation_token = use_segmentation_token and use_segmentation_head
 
-        self.backbone = ResNet34Backbone(pretrained=pretrained_backbone)
+        # Vision encoder: ResNet-34 with global average pooling → 512-d
+        backbone = resnet34(weights=ResNet34_Weights.DEFAULT if pretrained_backbone else None)
+        backbone.fc = nn.Identity()
+        self.vision_encoder = backbone
+        self.vision_dim = 512
 
+        # History encoder: 2-layer GRU
         gru_dropout = dropout if history_layers > 1 else 0.0
         self.history_encoder = nn.GRU(
             input_size=4,
@@ -232,21 +128,38 @@ class EgoDrivePlanner(nn.Module):
             batch_first=True,
             dropout=gru_dropout,
         )
+
+        # Command embedding
         self.command_embedding = nn.Embedding(3, command_feature_dim)
-        self.fusion = LightweightFusion(
-            history_hidden_dim=history_hidden_dim,
-            command_feature_dim=command_feature_dim,
-            image_feature_dim=image_feature_dim,
-            fusion_dim=fusion_dim,
-            dropout=dropout,
-            use_depth_token=self.use_depth_token,
-            use_segmentation_token=self.use_segmentation_token,
+
+        # FiLM conditioning: command → vision modulation
+        self.film_scale = nn.Linear(command_feature_dim, self.vision_dim)
+        self.film_bias = nn.Linear(command_feature_dim, self.vision_dim)
+
+        # Fusion MLP: concat [vis, hist, cmd, (tokens)] → context
+        fusion_in = self.vision_dim + history_hidden_dim + command_feature_dim
+        if self.use_depth_token:
+            fusion_in += image_feature_dim
+        if self.use_segmentation_token:
+            fusion_in += image_feature_dim
+
+        self.context_mlp = nn.Sequential(
+            nn.Linear(fusion_in, image_feature_dim * 2),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(image_feature_dim * 2, image_feature_dim),
+            nn.ReLU(inplace=True),
         )
 
+        # Autoregressive GRU decoder
         self.trajectory_decoder_cell = nn.GRUCell(
             input_size=4, hidden_size=image_feature_dim,
         )
         self.trajectory_output_head = nn.Linear(image_feature_dim, 4)
+
+        # Auxiliary decoders (need multi-scale features from backbone)
+        # Multi-scale features are extracted via _get_aux_features which walks
+        # the vision_encoder backbone layers manually.
 
         self.depth_decoder = DensePredictionDecoder(1) if use_depth_head else None
         self.segmentation_decoder = (
@@ -268,29 +181,54 @@ class EgoDrivePlanner(nn.Module):
             else None
         )
 
+    def _get_aux_features(self, camera: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Extract multi-scale features from vision_encoder backbone for aux decoders."""
+        backbone = self.vision_encoder
+        x = backbone.conv1(camera)
+        x = backbone.bn1(x)
+        x = backbone.relu(x)
+        x = backbone.maxpool(x)
+        layer1 = backbone.layer1(x)
+        layer2 = backbone.layer2(layer1)
+        layer3 = backbone.layer3(layer2)
+        layer4 = backbone.layer4(layer3)
+        return {
+            "layer1": layer1,
+            "layer2": layer2,
+            "layer3": layer3,
+            "layer4": layer4,
+        }
+
     def forward(
         self,
         camera: torch.Tensor,
         history: torch.Tensor,
         command: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        features = self.backbone(camera)
-        depth_token = None
-        segmentation_token = None
+        # Vision: global average pooling → (B, 512)
+        vis = self.vision_encoder(camera)
 
+        # FiLM conditioning on command
+        command_features = self.command_embedding(command)
+        scale = torch.sigmoid(self.film_scale(command_features))
+        bias = self.film_bias(command_features)
+        vis = vis * scale + bias
+
+        # History encoding
         _, history_hidden = self.history_encoder(history)
         history_features = history_hidden[-1]
-        command_features = self.command_embedding(command)
 
+        # Auxiliary tasks (need multi-scale features, detached from backbone)
+        depth_token = None
+        segmentation_token = None
         outputs: dict[str, torch.Tensor] = {}
+
         if self.depth_decoder is not None:
-            # Detach backbone features for aux decoders to protect backbone
-            detached_features = {k: v.detach() for k, v in features.items()}
+            with torch.no_grad():
+                aux_features = {k: v.detach() for k, v in self._get_aux_features(camera).items()}
             depth_prediction, depth_features = self.depth_decoder(
-                detached_features,
-                return_features=True,
+                aux_features, return_features=True,
             )
-            # Sigmoid constraint for depth output
             depth_prediction = torch.sigmoid(depth_prediction)
             outputs["depth"] = depth_prediction
             if self.depth_token_encoder is not None:
@@ -299,10 +237,10 @@ class EgoDrivePlanner(nn.Module):
                 )
 
         if self.segmentation_decoder is not None:
-            detached_features = {k: v.detach() for k, v in features.items()}
+            with torch.no_grad():
+                aux_features = {k: v.detach() for k, v in self._get_aux_features(camera).items()}
             segmentation_logits, segmentation_features = self.segmentation_decoder(
-                detached_features,
-                return_features=True,
+                aux_features, return_features=True,
             )
             outputs["segmentation_logits"] = segmentation_logits
             if self.segmentation_token_encoder is not None:
@@ -314,26 +252,24 @@ class EgoDrivePlanner(nn.Module):
                     )
                 )
 
-        fused_features = self.fusion(
-            features=features,
-            history_features=history_features,
-            command_features=command_features,
-            depth_token=depth_token,
-            segmentation_token=segmentation_token,
-        )
+        # Fusion: concat all features → context vector
+        fused = [vis, history_features, command_features]
+        if self.use_depth_token and depth_token is not None:
+            fused.append(depth_token)
+        if self.use_segmentation_token and segmentation_token is not None:
+            fused.append(segmentation_token)
+        ctx = self.context_mlp(torch.cat(fused, dim=1))
 
         # Autoregressive GRU decoder
         batch_size = camera.size(0)
         device = camera.device
-        h_dec = fused_features  # (B, image_feature_dim)
-        # Input: previous predicted delta_xy + absolute sin/cos heading
+        h_dec = ctx
         step_input = torch.zeros(batch_size, 4, device=device)
         step_outputs = []
         for _ in range(self.future_steps):
             h_dec = self.trajectory_decoder_cell(step_input, h_dec)
             step_out = self.trajectory_output_head(h_dec)
             step_outputs.append(step_out)
-            # Feed back: delta_xy from this step + absolute heading sin/cos
             step_input = step_out
 
         # Stack: (B, T, 4) where 4 = [dx, dy, sin(heading), cos(heading)]

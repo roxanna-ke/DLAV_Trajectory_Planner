@@ -59,16 +59,21 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-train-samples", type=int, default=None)
     parser.add_argument("--max-val-samples", type=int, default=None)
+    parser.add_argument(
+        "--resume",
+        default=None,
+        help="Path to checkpoint to resume from. Use 'weights-only' to load only model weights.",
+    )
     return parser
 
 
 def freeze_backbone_parameters(model: EgoDrivePlanner) -> None:
-    for parameter in model.backbone.parameters():
+    for parameter in model.vision_encoder.parameters():
         parameter.requires_grad = False
 
 
 def freeze_backbone_batchnorm(model: EgoDrivePlanner) -> None:
-    for module in model.backbone.modules():
+    for module in model.vision_encoder.modules():
         if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
             module.eval()
             if module.weight is not None:
@@ -306,7 +311,7 @@ def main() -> None:
     for name, parameter in model.named_parameters():
         if not parameter.requires_grad:
             continue
-        if name.startswith("backbone."):
+        if name.startswith("vision_encoder."):
             backbone_parameters.append(parameter)
         else:
             head_parameters.append(parameter)
@@ -329,9 +334,55 @@ def main() -> None:
 
     best_state = None
     best_val_ade = float("inf")
+    start_epoch = 1
     history: list[dict[str, float | int]] = []
 
-    for epoch in range(1, args.epochs + 1):
+    if args.resume:
+        resume_path = args.resume
+        resume_mode = "full"
+        if resume_path.endswith(":weights-only"):
+            resume_path = resume_path[: -len(":weights-only")]
+            resume_mode = "weights-only"
+
+        print(f"Resuming from {resume_path} (mode={resume_mode})")
+        checkpoint = torch.load(resume_path, map_location=device)
+        loaded_state = checkpoint["model_state_dict"]
+        model_state = model.state_dict()
+
+        # Filter out keys with shape mismatches (e.g. context_mlp when adding tokens)
+        filtered_state = {}
+        skipped_keys = []
+        for key, value in loaded_state.items():
+            if key in model_state and value.shape != model_state[key].shape:
+                skipped_keys.append(f"{key}: {value.shape} -> {model_state[key].shape}")
+            else:
+                filtered_state[key] = value
+
+        load_result = model.load_state_dict(filtered_state, strict=False)
+        if skipped_keys:
+            print(f"  Skipped size-mismatched keys (re-initialized):")
+            for sk in skipped_keys:
+                print(f"    {sk}")
+        if load_result.missing_keys:
+            print(f"  Missing keys (randomly initialized): {load_result.missing_keys}")
+        if load_result.unexpected_keys:
+            print(f"  Unexpected keys (ignored): {load_result.unexpected_keys}")
+
+        if resume_mode == "full":
+            optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            start_epoch = checkpoint["epoch"] + 1
+            best_val_ade = checkpoint.get("best_val_ade", float("inf"))
+            # Re-wind scheduler to the correct step
+            for _ in range(checkpoint["epoch"]):
+                scheduler.step()
+            print(
+                f"  Restored epoch {checkpoint['epoch']}, "
+                f"best_val_ade={best_val_ade:.4f}, continuing from epoch {start_epoch}"
+            )
+        else:
+            print("  Weights-only mode: optimizer and scheduler reset from scratch")
+
+    for epoch in range(start_epoch, args.epochs + 1):
         model.train()
         freeze_backbone_batchnorm(model)
         aux_scale = compute_aux_scale(
