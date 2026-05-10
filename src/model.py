@@ -243,15 +243,10 @@ class EgoDrivePlanner(nn.Module):
             use_segmentation_token=self.use_segmentation_token,
         )
 
-        self.trajectory_decoder = nn.Sequential(
-            nn.Linear(image_feature_dim, 512),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-            nn.Linear(512, 256),
-            nn.ReLU(inplace=True),
-            nn.Dropout(dropout),
-            nn.Linear(256, future_steps * 4),
+        self.trajectory_decoder_cell = nn.GRUCell(
+            input_size=4, hidden_size=image_feature_dim,
         )
+        self.trajectory_output_head = nn.Linear(image_feature_dim, 4)
 
         self.depth_decoder = DensePredictionDecoder(1) if use_depth_head else None
         self.segmentation_decoder = (
@@ -289,27 +284,32 @@ class EgoDrivePlanner(nn.Module):
 
         outputs: dict[str, torch.Tensor] = {}
         if self.depth_decoder is not None:
+            # Detach backbone features for aux decoders to protect backbone
+            detached_features = {k: v.detach() for k, v in features.items()}
             depth_prediction, depth_features = self.depth_decoder(
-                features,
+                detached_features,
                 return_features=True,
             )
+            # Sigmoid constraint for depth output
+            depth_prediction = torch.sigmoid(depth_prediction)
             outputs["depth"] = depth_prediction
             if self.depth_token_encoder is not None:
                 depth_token = self.depth_token_encoder(
-                    torch.cat([depth_features, depth_prediction], dim=1)
+                    torch.cat([depth_features.detach(), depth_prediction.detach()], dim=1)
                 )
 
         if self.segmentation_decoder is not None:
+            detached_features = {k: v.detach() for k, v in features.items()}
             segmentation_logits, segmentation_features = self.segmentation_decoder(
-                features,
+                detached_features,
                 return_features=True,
             )
             outputs["segmentation_logits"] = segmentation_logits
             if self.segmentation_token_encoder is not None:
-                segmentation_probabilities = torch.softmax(segmentation_logits, dim=1)
+                segmentation_probabilities = torch.softmax(segmentation_logits.detach(), dim=1)
                 segmentation_token = self.segmentation_token_encoder(
                     torch.cat(
-                        [segmentation_features, segmentation_probabilities],
+                        [segmentation_features.detach(), segmentation_probabilities],
                         dim=1,
                     )
                 )
@@ -321,7 +321,28 @@ class EgoDrivePlanner(nn.Module):
             depth_token=depth_token,
             segmentation_token=segmentation_token,
         )
-        trajectory = self.trajectory_decoder(fused_features)
-        trajectory = trajectory.view(camera.size(0), self.future_steps, 4)
+
+        # Autoregressive GRU decoder
+        batch_size = camera.size(0)
+        device = camera.device
+        h_dec = fused_features  # (B, image_feature_dim)
+        # Input: previous predicted delta_xy + absolute sin/cos heading
+        step_input = torch.zeros(batch_size, 4, device=device)
+        step_outputs = []
+        for _ in range(self.future_steps):
+            h_dec = self.trajectory_decoder_cell(step_input, h_dec)
+            step_out = self.trajectory_output_head(h_dec)
+            step_outputs.append(step_out)
+            # Feed back: delta_xy from this step + absolute heading sin/cos
+            step_input = step_out
+
+        # Stack: (B, T, 4) where 4 = [dx, dy, sin(heading), cos(heading)]
+        pred_steps = torch.stack(step_outputs, dim=1)
+        # Cumsum on xy deltas to get absolute relative positions
+        # Heading sin/cos are predicted as absolute values (not deltas)
+        trajectory = torch.cat([
+            torch.cumsum(pred_steps[..., :2], dim=1),
+            pred_steps[..., 2:],
+        ], dim=-1)
         outputs["trajectory"] = trajectory
         return outputs
