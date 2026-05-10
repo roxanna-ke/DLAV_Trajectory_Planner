@@ -13,7 +13,7 @@ class EgoDrivePlanner(nn.Module):
         pretrained_backbone: bool = True,
         image_feature_dim: int = 256,
         history_hidden_dim: int = 128,
-        command_feature_dim: int = 64,
+        command_feature_dim: int = 32,
         history_layers: int = 2,
         fusion_dim: int = 256,
         fusion_heads: int = 4,
