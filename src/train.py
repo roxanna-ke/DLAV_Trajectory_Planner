@@ -62,6 +62,11 @@ def build_argparser() -> argparse.ArgumentParser:
         default=None,
         help="Path to checkpoint to resume from. Use 'weights-only' to load only model weights.",
     )
+    parser.add_argument(
+        "--reset-trajectory-head-on-resume",
+        action="store_true",
+        help="Drop trajectory decoder/output head weights when loading a resume checkpoint.",
+    )
     return parser
 
 
@@ -215,9 +220,9 @@ def evaluate(
             total_fde_loss += metrics["fde_loss"] * batch_size
             total_depth_loss += metrics["depth_loss"] * batch_size
             total_segmentation_loss += metrics["segmentation_loss"] * batch_size
-            total_weighted_depth_loss += float(weighted_depth_loss.detach().item() if isinstance(weighted_depth_loss, torch.Tensor) else weighted_depth_loss) * batch_size
+            total_weighted_depth_loss += float(weighted_depth_loss.detach().item()) * batch_size
             total_weighted_segmentation_loss += (
-                float(weighted_segmentation_loss.detach().item() if isinstance(weighted_segmentation_loss, torch.Tensor) else weighted_segmentation_loss) * batch_size
+                float(weighted_segmentation_loss.detach().item()) * batch_size
             )
             total_ade += ade.item() * batch_size
             total_fde += fde.item() * batch_size
@@ -339,6 +344,9 @@ def main() -> None:
         if resume_path.endswith(":weights-only"):
             resume_path = resume_path[: -len(":weights-only")]
             resume_mode = "weights-only"
+        if args.reset_trajectory_head_on_resume and resume_mode == "full":
+            print("Resetting trajectory decoder requires weights-only resume; optimizer and scheduler will be reset.")
+            resume_mode = "weights-only"
 
         print(f"Resuming from {resume_path} (mode={resume_mode})")
         checkpoint = torch.load(resume_path, map_location=device)
@@ -355,6 +363,20 @@ def main() -> None:
             renamed_state[new_key] = value
         loaded_state = renamed_state
 
+        reset_keys = []
+        if args.reset_trajectory_head_on_resume:
+            drop_prefixes = (
+                "trajectory_decoder_cell.",
+                "trajectory_output_head.",
+            )
+            filtered_for_reset = {}
+            for key, value in loaded_state.items():
+                if any(key.startswith(prefix) for prefix in drop_prefixes):
+                    reset_keys.append(key)
+                    continue
+                filtered_for_reset[key] = value
+            loaded_state = filtered_for_reset
+
         # Filter out keys with shape mismatches
         filtered_state = {}
         skipped_keys = []
@@ -369,6 +391,8 @@ def main() -> None:
             print(f"  Skipped size-mismatched keys (re-initialized):")
             for sk in skipped_keys:
                 print(f"    {sk}")
+        if reset_keys:
+            print(f"  Reset trajectory decoder/head weights: {reset_keys}")
         if load_result.missing_keys:
             print(f"  Missing keys (randomly initialized): {load_result.missing_keys}")
         if load_result.unexpected_keys:
@@ -550,6 +574,7 @@ def main() -> None:
             | {
                 "use_depth_head": args.use_depth_head,
                 "use_segmentation_head": args.use_segmentation_head,
+                "coordinate_frame": "ego",
             },
         }
         torch.save(checkpoint, output_dir / "last_checkpoint.pt")

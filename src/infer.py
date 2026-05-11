@@ -9,7 +9,7 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from src.data import DrivingDataset, list_pickle_files
+from src.data import DrivingDataset, decode_xy_from_ego, list_pickle_files
 from src.model import EgoDrivePlanner
 from src.utils import get_device
 
@@ -68,7 +68,14 @@ def load_model(
         use_segmentation_head=config.get("use_segmentation_head", False),
         num_segmentation_classes=config["num_segmentation_classes"],
     )
-    model.load_state_dict(checkpoint["model_state_dict"])
+    renamed_state = {}
+    for key, value in checkpoint["model_state_dict"].items():
+        if key.startswith("backbone.") or key.startswith("vision_encoder."):
+            new_key = "stem." + key.split(".", 1)[1]
+        else:
+            new_key = key
+        renamed_state[new_key] = value
+    model.load_state_dict(renamed_state)
     model.to(device)
     model.eval()
     return model, image_height, image_width
@@ -112,9 +119,14 @@ def main() -> None:
             history = batch["history"].to(device)
             command = batch["command"].to(device)
             last_pos = batch["last_pos"].to(device)
+            last_heading = batch["last_heading"].to(device)
 
             outputs = model(camera, history, command)
-            prediction_xy = outputs["trajectory"][..., :2] + last_pos.unsqueeze(1)
+            prediction_xy = decode_xy_from_ego(
+                outputs["trajectory"][..., :2],
+                origin_xy=last_pos,
+                origin_heading=last_heading,
+            )
             predictions.append(prediction_xy.cpu().numpy())
             sample_ids.extend(batch["sample_id"].tolist())
 

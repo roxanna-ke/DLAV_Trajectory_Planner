@@ -18,10 +18,44 @@ COMMAND_TO_INDEX = {
 }
 
 
-def encode_pose_sequence(sequence: torch.Tensor, *, origin_xy: torch.Tensor) -> torch.Tensor:
-    xy = sequence[:, :2] - origin_xy
-    heading = sequence[:, 2:3]
-    return torch.cat([xy, torch.sin(heading), torch.cos(heading)], dim=-1)
+def encode_pose_sequence(
+    sequence: torch.Tensor,
+    *,
+    origin_xy: torch.Tensor,
+    origin_heading: torch.Tensor,
+) -> torch.Tensor:
+    relative_xy = sequence[:, :2] - origin_xy
+    cos_heading = torch.cos(origin_heading)
+    sin_heading = torch.sin(origin_heading)
+    xy_ego = torch.stack(
+        [
+            cos_heading * relative_xy[:, 0] + sin_heading * relative_xy[:, 1],
+            -sin_heading * relative_xy[:, 0] + cos_heading * relative_xy[:, 1],
+        ],
+        dim=-1,
+    )
+    heading = sequence[:, 2:3] - origin_heading
+    return torch.cat([xy_ego, torch.sin(heading), torch.cos(heading)], dim=-1)
+
+
+def decode_xy_from_ego(
+    relative_xy: torch.Tensor,
+    *,
+    origin_xy: torch.Tensor,
+    origin_heading: torch.Tensor,
+) -> torch.Tensor:
+    cos_heading = torch.cos(origin_heading)
+    sin_heading = torch.sin(origin_heading)
+
+    for _ in range(relative_xy.ndim - origin_heading.ndim - 1):
+        cos_heading = cos_heading.unsqueeze(-1)
+        sin_heading = sin_heading.unsqueeze(-1)
+    for _ in range(relative_xy.ndim - origin_xy.ndim):
+        origin_xy = origin_xy.unsqueeze(-2)
+
+    world_x = cos_heading * relative_xy[..., 0] - sin_heading * relative_xy[..., 1]
+    world_y = sin_heading * relative_xy[..., 0] + cos_heading * relative_xy[..., 1]
+    return torch.stack([world_x, world_y], dim=-1) + origin_xy
 
 
 def build_eval_camera_transform(
@@ -117,7 +151,12 @@ class DrivingDataset(Dataset):
         command = COMMAND_TO_INDEX[data["driving_command"]]
         history_raw = torch.as_tensor(data["sdc_history_feature"], dtype=torch.float32)
         last_pos = history_raw[-1, :2].clone()
-        history = encode_pose_sequence(history_raw, origin_xy=last_pos)
+        last_heading = history_raw[-1, 2].clone()
+        history = encode_pose_sequence(
+            history_raw,
+            origin_xy=last_pos,
+            origin_heading=last_heading,
+        )
         if self.augment:
             history[:, :2] += torch.randn_like(history[:, :2]) * 0.05
 
@@ -126,6 +165,7 @@ class DrivingDataset(Dataset):
             "command": torch.tensor(command, dtype=torch.long),
             "history": history,
             "last_pos": last_pos,
+            "last_heading": last_heading,
             "sample_id": int(sample_path.stem),
         }
 
@@ -133,7 +173,11 @@ class DrivingDataset(Dataset):
             future_raw = torch.as_tensor(
                 data["sdc_future_feature"], dtype=torch.float32
             )
-            item["future"] = encode_pose_sequence(future_raw, origin_xy=last_pos)
+            item["future"] = encode_pose_sequence(
+                future_raw,
+                origin_xy=last_pos,
+                origin_heading=last_heading,
+            )
             item["depth"] = self._resize_depth_map(data["depth"])
             item["semantic_label"] = self._resize_segmentation_map(data["semantic_label"])
 
