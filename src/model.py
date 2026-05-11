@@ -55,8 +55,6 @@ class EgoDrivePlanner(nn.Module):
         self.film_bias = nn.Linear(command_feature_dim, self.vision_dim)
 
         # Fusion MLP: concat [vis, hist, cmd] → context
-        # Aux features are NOT injected into the planner — they only regularize
-        # the stem via their loss gradients (proven effective in aux_from_baseline).
         fusion_in = self.vision_dim + history_hidden_dim + command_feature_dim
         self.context_mlp = nn.Sequential(
             nn.Linear(fusion_in, 512),
@@ -66,10 +64,9 @@ class EgoDrivePlanner(nn.Module):
             nn.ReLU(inplace=True),
         )
 
-        # Autoregressive GRU decoder (ctx injected at every step)
-        self.ctx_proj = nn.Linear(image_feature_dim, 4)
+        # Autoregressive GRU decoder
         self.trajectory_decoder_cell = nn.GRUCell(
-            input_size=8, hidden_size=image_feature_dim,  # 4 (step) + 4 (ctx_proj)
+            input_size=4, hidden_size=image_feature_dim,
         )
         self.trajectory_output_head = nn.Linear(image_feature_dim, 4)
 
@@ -115,26 +112,16 @@ class EgoDrivePlanner(nn.Module):
         _, history_hidden = self.history_encoder(history)
         history_features = history_hidden[-1]
 
-        # Auxiliary decoder: aux heads only — gradients flow back to stem for
-        # regularization (the mechanism that made aux_from_baseline successful).
-        aux = None
-        if self.aux_decoder is not None and (self.depth_head is not None or self.semantic_head is not None):
-            aux = self.aux_decoder(fmap)          # (B, 128, h, w) — NO detach
-
-        device = camera.device
-
         # Fusion: concat [vis, hist, cmd] → context vector
-        fusion_parts = [vis, history_features, command_features]
-        ctx = self.context_mlp(torch.cat(fusion_parts, dim=1))
+        ctx = self.context_mlp(torch.cat([vis, history_features, command_features], dim=1))
 
-        # Autoregressive GRU decoder with per-step ctx injection
+        # Autoregressive GRU decoder
+        device = camera.device
         h_dec = ctx
-        ctx_step = self.ctx_proj(ctx)                      # (B, 4) — projected ctx for each step
         step_input = torch.zeros(B, 4, device=device)
         step_outputs = []
         for _ in range(self.future_steps):
-            gru_input = torch.cat([step_input, ctx_step], dim=1)  # (B, 8)
-            h_dec = self.trajectory_decoder_cell(gru_input, h_dec)
+            h_dec = self.trajectory_decoder_cell(step_input, h_dec)
             step_out = self.trajectory_output_head(h_dec)
             step_outputs.append(step_out)
             step_input = step_out
@@ -150,8 +137,10 @@ class EgoDrivePlanner(nn.Module):
 
         outputs: dict[str, torch.Tensor] = {"trajectory": trajectory}
 
-        # Auxiliary heads: reuse aux features computed above
-        if aux is not None:
+        # Auxiliary heads: shared feature map → lightweight decoder → upsample
+        # Gradients flow back to stem, which is the key mechanism for aux to help planning
+        if self.aux_decoder is not None and (self.depth_head is not None or self.semantic_head is not None):
+            aux = self.aux_decoder(fmap)                  # (B, 128, h, w)
             if self.semantic_head is not None:
                 semantic_logits = self.semantic_head(aux)  # (B, C, h, w)
                 semantic_logits = torch_f.interpolate(
@@ -163,7 +152,7 @@ class EgoDrivePlanner(nn.Module):
                 depth_pred = torch_f.interpolate(
                     depth_pred, size=(H, W), mode="bilinear", align_corners=False,
                 )
-                # No sigmoid — directly regress log1p-normalized depth target
+                depth_pred = torch.sigmoid(depth_pred)
                 outputs["depth"] = depth_pred
 
         return outputs
