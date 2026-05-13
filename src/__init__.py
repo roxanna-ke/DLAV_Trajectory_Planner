@@ -1,2 +1,2 @@
-"""Milestone 1 package for the EgoDrive project."""
+"""Phase 2/3 trajectory planner with auxiliary perception tasks."""
 

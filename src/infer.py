@@ -11,7 +11,7 @@ from tqdm import tqdm
 
 from src.data import DrivingDataset, decode_xy_from_ego, list_pickle_files
 from src.model import EgoDrivePlanner
-from src.utils import get_device
+from src.utils import ensure_dir, get_device, rename_legacy_checkpoint_keys
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -23,7 +23,11 @@ def build_argparser() -> argparse.ArgumentParser:
         default="outputs/hybrid_resnet34_local_fusion/best_checkpoint.pt",
     )
     parser.add_argument("--test-dir", default="test_public")
-    parser.add_argument("--output-csv", default="submission_hybrid.csv")
+    parser.add_argument(
+        "--output-csv",
+        default=None,
+        help="Optional output path. Defaults to a submission CSV next to the checkpoint.",
+    )
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--image-size", type=int, default=None)
@@ -64,21 +68,36 @@ def load_model(
         fusion_heads=config["fusion_heads"],
         dropout=config["dropout"],
         future_steps=config["future_steps"],
-        use_depth_head=config.get("use_depth_head", False),
         use_segmentation_head=config.get("use_segmentation_head", False),
+        use_depth_head=config.get("use_depth_head", False),
         num_segmentation_classes=config["num_segmentation_classes"],
+        use_layer3_spatial_pooling=config.get("use_layer3_spatial_pooling", False),
+        layer3_spatial_scale=config.get("layer3_spatial_scale", 0.1),
+        layer3_spatial_grid_height=config.get("layer3_spatial_grid_height", 4),
+        layer3_spatial_grid_width=config.get("layer3_spatial_grid_width", 6),
     )
-    renamed_state = {}
-    for key, value in checkpoint["model_state_dict"].items():
-        if key.startswith("backbone.") or key.startswith("vision_encoder."):
-            new_key = "stem." + key.split(".", 1)[1]
-        else:
-            new_key = key
-        renamed_state[new_key] = value
-    model.load_state_dict(renamed_state)
+    renamed_state = rename_legacy_checkpoint_keys(checkpoint["model_state_dict"])
+    load_result = model.load_state_dict(renamed_state, strict=False)
+    if load_result.missing_keys:
+        print(f"Missing keys: {load_result.missing_keys}")
+    if load_result.unexpected_keys:
+        print(f"Unexpected keys (ignored): {load_result.unexpected_keys}")
     model.to(device)
     model.eval()
     return model, image_height, image_width
+
+
+def resolve_output_csv(
+    checkpoint_path: str | Path,
+    output_csv: str | None,
+) -> Path:
+    checkpoint_path = Path(checkpoint_path)
+    if output_csv is not None:
+        resolved_output = Path(output_csv)
+    else:
+        resolved_output = checkpoint_path.parent / f"submission_{checkpoint_path.stem}.csv"
+    ensure_dir(resolved_output.parent)
+    return resolved_output
 
 
 def main() -> None:
@@ -87,6 +106,8 @@ def main() -> None:
     if args.image_size is not None:
         args.image_height = args.image_size
         args.image_width = args.image_size
+
+    output_csv_path = resolve_output_csv(args.checkpoint, args.output_csv)
 
     model, image_height, image_width = load_model(
         args.checkpoint,
@@ -140,9 +161,9 @@ def main() -> None:
     submission = pd.DataFrame(flat_predictions)
     submission.insert(0, "id", sample_ids)
     submission.columns = column_names
-    submission.to_csv(args.output_csv, index=False)
+    submission.to_csv(output_csv_path, index=False)
 
-    print(f"Saved submission to {args.output_csv}")
+    print(f"Saved submission to {output_csv_path}")
     print(f"Rows: {len(submission)}, columns: {len(submission.columns)}")
 
 
