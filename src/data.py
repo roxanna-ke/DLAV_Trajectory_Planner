@@ -87,13 +87,15 @@ def build_train_camera_transform(
                 (image_height, image_width),
                 interpolation=InterpolationMode.BILINEAR,
             ),
-            transforms.ToTensor(),
             transforms.ColorJitter(
-                brightness=0.2,
-                contrast=0.2,
-                saturation=0.2,
-                hue=0.05,
+                brightness=0.3,
+                contrast=0.3,
+                saturation=0.3,
+                hue=0.08,
             ),
+            transforms.RandomGrayscale(p=0.1),
+            transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.0)),
+            transforms.ToTensor(),
             transforms.Normalize(
                 mean=[0.485, 0.456, 0.406],
                 std=[0.229, 0.224, 0.225],
@@ -178,27 +180,25 @@ class DrivingDataset(Dataset):
                 origin_xy=last_pos,
                 origin_heading=last_heading,
             )
-            item["depth"] = self._resize_depth_map(data["depth"])
             item["semantic_label"] = self._resize_segmentation_map(data["semantic_label"])
 
+            if "depth" in data:
+                depth_tensor = torch.as_tensor(data["depth"], dtype=torch.float32)
+                if depth_tensor.ndim == 2:
+                    depth_tensor = depth_tensor.unsqueeze(0)
+                elif depth_tensor.ndim == 3:
+                    depth_tensor = depth_tensor.permute(2, 0, 1)
+                max_depth = 100.0
+                depth_tensor = torch.log1p(depth_tensor) / torch.log1p(torch.tensor(max_depth))
+                depth_tensor = torch_f.interpolate(
+                    depth_tensor.unsqueeze(0),
+                    size=(self.image_height, self.image_width),
+                    mode="bilinear",
+                    align_corners=False,
+                ).squeeze(0)
+                item["depth"] = depth_tensor
+
         return item
-
-    def _resize_depth_map(self, depth_map: object) -> torch.Tensor:
-        depth_tensor = torch.as_tensor(depth_map, dtype=torch.float32)
-        if depth_tensor.ndim == 2:
-            depth_tensor = depth_tensor.unsqueeze(0)
-        elif depth_tensor.ndim == 3:
-            depth_tensor = depth_tensor.permute(2, 0, 1)
-        else:
-            raise ValueError(f"Unsupported depth map shape: {tuple(depth_tensor.shape)}")
-
-        resized = torch_f.interpolate(
-            depth_tensor.unsqueeze(0),
-            size=(self.image_height, self.image_width),
-            mode="bilinear",
-            align_corners=False,
-        )
-        return torch.log1p(resized.squeeze(0)) / torch.log1p(torch.tensor(255.0))
 
     def _resize_segmentation_map(self, segmentation_map: object) -> torch.Tensor:
         segmentation_tensor = torch.as_tensor(segmentation_map, dtype=torch.float32)

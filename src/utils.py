@@ -33,3 +33,33 @@ def ensure_dir(path: str | Path) -> Path:
 
 def save_json(path: str | Path, payload: dict[str, Any]) -> None:
     Path(path).write_text(json.dumps(payload, indent=2, sort_keys=True))
+
+
+def rename_legacy_checkpoint_keys(
+    state_dict: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    renamed_state: dict[str, torch.Tensor] = {}
+
+    for key, value in state_dict.items():
+        new_key = key
+
+        if key.startswith("backbone.") or key.startswith("vision_encoder."):
+            old_subkey = key.split(".", 1)[1]
+            if old_subkey.startswith("layer4."):
+                new_key = "stem_layer4." + old_subkey.split(".", 1)[1]
+            else:
+                new_key = "stem_layer3." + old_subkey
+        elif key.startswith("stem."):
+            old_subkey = key.split(".", 1)[1]
+            if old_subkey.startswith("7."):
+                new_key = "stem_layer4." + old_subkey.split(".", 1)[1]
+            else:
+                new_key = "stem_layer3." + old_subkey
+        elif key.startswith("decoder_cell."):
+            new_key = "trajectory_decoder_cell." + key.split(".", 1)[1]
+        elif key.startswith("output_head."):
+            new_key = "trajectory_output_head." + key.split(".", 1)[1]
+
+        renamed_state[new_key] = value
+
+    return renamed_state

@@ -13,29 +13,54 @@ class EgoDrivePlanner(nn.Module):
         pretrained_backbone: bool = True,
         image_feature_dim: int = 256,
         history_hidden_dim: int = 128,
-        command_feature_dim: int = 32,
+        command_feature_dim: int = 64,
         history_layers: int = 2,
         fusion_dim: int = 256,
         fusion_heads: int = 4,
         dropout: float = 0.1,
         future_steps: int = 60,
-        use_depth_head: bool = True,
         use_segmentation_head: bool = True,
+        use_depth_head: bool = False,
         num_segmentation_classes: int = 15,
+        use_layer3_spatial_pooling: bool = False,
+        layer3_spatial_scale: float = 0.1,
+        layer3_spatial_grid_height: int = 4,
+        layer3_spatial_grid_width: int = 6,
     ) -> None:
         super().__init__()
         self.future_steps = future_steps
-        self.use_depth_head = use_depth_head
         self.use_segmentation_head = use_segmentation_head
+        self.use_depth_head = use_depth_head
+        self.use_layer3_spatial_pooling = use_layer3_spatial_pooling
+        self.spatial_feature_dim = 256
 
-        # Vision encoder: ResNet-34 stem (conv layers) + global average pooling
+        # Vision encoder: ResNet-34 — split stem to access layer3 output for spatial pooling
         backbone = resnet34(weights=ResNet34_Weights.DEFAULT if pretrained_backbone else None)
-        self.stem = nn.Sequential(
+        self.stem_layer3 = nn.Sequential(
             backbone.conv1, backbone.bn1, backbone.relu, backbone.maxpool,
-            backbone.layer1, backbone.layer2, backbone.layer3, backbone.layer4,
+            backbone.layer1, backbone.layer2, backbone.layer3,
         )
+        self.stem_layer4 = backbone.layer4
+        self.layer3_dim = 256
         self.vision_dim = 512
         self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
+
+        # Layer3 spatial grid pooling: preserve spatial layout as a separate fusion input
+        self.layer3_spatial_pool = None
+        self.layer3_spatial_projection = None
+        if use_layer3_spatial_pooling:
+            self.layer3_spatial_pool = nn.AdaptiveAvgPool2d(
+                (layer3_spatial_grid_height, layer3_spatial_grid_width)
+            )
+            spatial_flat_dim = self.layer3_dim * layer3_spatial_grid_height * layer3_spatial_grid_width
+            self.layer3_spatial_projection = nn.Sequential(
+                nn.Flatten(start_dim=1),
+                nn.Linear(spatial_flat_dim, 512),
+                nn.ReLU(inplace=True),
+                nn.Dropout(dropout),
+                nn.Linear(512, self.spatial_feature_dim),
+                nn.ReLU(inplace=True),
+            )
 
         # History encoder: 2-layer GRU
         gru_dropout = dropout if history_layers > 1 else 0.0
@@ -50,17 +75,15 @@ class EgoDrivePlanner(nn.Module):
         # Command embedding
         self.command_embedding = nn.Embedding(3, command_feature_dim)
 
-        # FiLM conditioning: command → vision modulation
-        self.film_scale = nn.Linear(command_feature_dim, self.vision_dim)
-        self.film_bias = nn.Linear(command_feature_dim, self.vision_dim)
-
-        # Fusion MLP: concat [vis, hist, cmd] → context
-        fusion_in = self.vision_dim + history_hidden_dim + command_feature_dim
+        # Fusion MLP: concat [global vis, spatial vis, hist, cmd] → context
+        fusion_in = self.vision_dim + self.spatial_feature_dim + history_hidden_dim + command_feature_dim
         self.context_mlp = nn.Sequential(
             nn.Linear(fusion_in, 512),
+            nn.LayerNorm(512),
             nn.ReLU(inplace=True),
             nn.Dropout(dropout),
             nn.Linear(512, image_feature_dim),
+            nn.LayerNorm(image_feature_dim),
             nn.ReLU(inplace=True),
         )
 
@@ -76,7 +99,7 @@ class EgoDrivePlanner(nn.Module):
         self.semantic_head = None
         self.depth_head = None
 
-        if use_depth_head or use_segmentation_head:
+        if use_segmentation_head or use_depth_head:
             self.aux_decoder = nn.Sequential(
                 nn.Conv2d(512, 256, kernel_size=3, padding=1),
                 nn.BatchNorm2d(256),
@@ -85,10 +108,10 @@ class EgoDrivePlanner(nn.Module):
                 nn.BatchNorm2d(128),
                 nn.ReLU(inplace=True),
             )
-        if use_segmentation_head:
-            self.semantic_head = nn.Conv2d(128, num_segmentation_classes, kernel_size=1)
-        if use_depth_head:
-            self.depth_head = nn.Conv2d(128, 1, kernel_size=1)
+            if use_segmentation_head:
+                self.semantic_head = nn.Conv2d(128, num_segmentation_classes, kernel_size=1)
+            if use_depth_head:
+                self.depth_head = nn.Conv2d(128, 1, kernel_size=1)
 
     def forward(
         self,
@@ -98,22 +121,39 @@ class EgoDrivePlanner(nn.Module):
     ) -> dict[str, torch.Tensor]:
         B, _, H, W = camera.shape
 
-        # Vision: stem → feature map, then global pool → (B, 512)
-        fmap = self.stem(camera)                          # (B, 512, h, w)
-        vis = self.global_pool(fmap).flatten(1)           # (B, 512)
+        # Vision: stem split — layer3 for spatial, layer4 for global pool + aux
+        fmap_layer3 = self.stem_layer3(camera)              # (B, 256, 14, 21)
+        fmap = self.stem_layer4(fmap_layer3)                # (B, 512, 7, 10)
+        vis_global = self.global_pool(fmap).flatten(1)      # (B, 512)
 
-        # FiLM conditioning on command
+        if (
+            self.use_layer3_spatial_pooling
+            and self.layer3_spatial_pool is not None
+            and self.layer3_spatial_projection is not None
+        ):
+            vis_spatial = self.layer3_spatial_projection(
+                self.layer3_spatial_pool(fmap_layer3)
+            )                                              # (B, 256)
+        else:
+            vis_spatial = torch.zeros(
+                B,
+                self.spatial_feature_dim,
+                device=camera.device,
+                dtype=vis_global.dtype,
+            )
+
         command_features = self.command_embedding(command)
-        scale = torch.sigmoid(self.film_scale(command_features))
-        bias = self.film_bias(command_features)
-        vis = vis * scale + bias
 
         # History encoding
         _, history_hidden = self.history_encoder(history)
         history_features = history_hidden[-1]
 
-        # Fusion: concat [vis, hist, cmd] → context vector
-        ctx = self.context_mlp(torch.cat([vis, history_features, command_features], dim=1))
+        # Fusion: concat [global vis, spatial vis, hist, cmd] → context vector
+        ctx_input = torch.cat(
+            [vis_global, vis_spatial, history_features, command_features],
+            dim=1,
+        )
+        ctx = self.context_mlp(ctx_input)
 
         # Autoregressive GRU decoder
         device = camera.device
@@ -139,7 +179,7 @@ class EgoDrivePlanner(nn.Module):
 
         # Auxiliary heads: shared feature map → lightweight decoder → upsample
         # Gradients flow back to stem, which is the key mechanism for aux to help planning
-        if self.aux_decoder is not None and (self.depth_head is not None or self.semantic_head is not None):
+        if self.aux_decoder is not None:
             aux = self.aux_decoder(fmap)                  # (B, 128, h, w)
             if self.semantic_head is not None:
                 semantic_logits = self.semantic_head(aux)  # (B, C, h, w)
@@ -148,11 +188,10 @@ class EgoDrivePlanner(nn.Module):
                 )
                 outputs["segmentation_logits"] = semantic_logits
             if self.depth_head is not None:
-                depth_pred = self.depth_head(aux)         # (B, 1, h, w)
+                depth_pred = self.depth_head(aux)          # (B, 1, h, w)
                 depth_pred = torch_f.interpolate(
                     depth_pred, size=(H, W), mode="bilinear", align_corners=False,
                 )
-                depth_pred = torch.sigmoid(depth_pred)
-                outputs["depth"] = depth_pred
+                outputs["depth_prediction"] = depth_pred
 
         return outputs
