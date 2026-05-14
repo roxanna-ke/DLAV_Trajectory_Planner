@@ -13,7 +13,7 @@ from tqdm import tqdm
 from src.data import DrivingDataset, decode_xy_from_ego, list_pickle_files
 from src.metrics import displacement_errors, depth_loss, segmentation_loss
 from src.model import EgoDrivePlanner
-from src.utils import ensure_dir, get_device, save_json, set_seed
+from src.utils import ensure_dir, get_device, rename_legacy_checkpoint_keys, save_json, set_seed
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -50,6 +50,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--heading-weight", type=float, default=0.1)
     parser.add_argument("--fde-weight", type=float, default=0.15)
+    parser.add_argument("--ade-weight", type=float, default=1.0)
     parser.add_argument("--depth-loss-weight", type=float, default=0.1)
     parser.add_argument("--segmentation-loss-weight", type=float, default=0.2)
     parser.add_argument("--aux-warmup-epochs", type=int, default=5)
@@ -126,6 +127,7 @@ def trajectory_objective(
     time_weights: torch.Tensor,
     heading_weight: float,
     fde_weight: float,
+    ade_weight: float,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     prediction_xy = prediction[..., :2].contiguous()
     target_xy = target[..., :2].contiguous()
@@ -144,10 +146,17 @@ def trajectory_objective(
         target_heading,
         beta=1.0,
     )
+    ade_loss = torch.linalg.norm(prediction_xy - target_xy, dim=-1).mean()
     fde_loss = torch.linalg.norm(prediction_xy[:, -1] - target_xy[:, -1], dim=-1).mean()
 
-    total_loss = xy_loss + heading_weight * heading_loss + fde_weight * fde_loss
+    total_loss = (
+        ade_weight * ade_loss
+        + xy_loss
+        + heading_weight * heading_loss
+        + fde_weight * fde_loss
+    )
     metrics = {
+        "ade_loss": float(ade_loss.detach().item()),
         "xy_loss": float(xy_loss.detach().item()),
         "heading_loss": float(heading_loss.detach().item()),
         "fde_loss": float(fde_loss.detach().item()),
@@ -164,11 +173,13 @@ def evaluate(
     time_weights: torch.Tensor,
     heading_weight: float,
     fde_weight: float,
+    ade_weight: float,
     depth_loss_weight: float,
     segmentation_loss_weight: float,
 ) -> dict[str, float]:
     model.eval()
     total_loss = 0.0
+    total_ade_loss = 0.0
     total_xy_loss = 0.0
     total_heading_loss = 0.0
     total_fde_loss = 0.0
@@ -196,6 +207,7 @@ def evaluate(
                 time_weights=time_weights,
                 heading_weight=heading_weight,
                 fde_weight=fde_weight,
+                ade_weight=ade_weight,
             )
             weighted_depth_loss = torch.tensor(0.0, device=device)
             weighted_segmentation_loss = torch.tensor(0.0, device=device)
@@ -223,6 +235,7 @@ def evaluate(
             batch_size = camera.size(0)
             total_samples += batch_size
             total_loss += loss.item() * batch_size
+            total_ade_loss += metrics["ade_loss"] * batch_size
             total_xy_loss += metrics["xy_loss"] * batch_size
             total_heading_loss += metrics["heading_loss"] * batch_size
             total_fde_loss += metrics["fde_loss"] * batch_size
@@ -237,6 +250,7 @@ def evaluate(
 
     return {
         "loss": total_loss / total_samples,
+        "ade_loss": total_ade_loss / total_samples,
         "xy_loss": total_xy_loss / total_samples,
         "heading_loss": total_heading_loss / total_samples,
         "fde_loss": total_fde_loss / total_samples,
@@ -427,15 +441,7 @@ def main() -> None:
         loaded_state = checkpoint["model_state_dict"]
         model_state = model.state_dict()
 
-        # Rename legacy keys: backbone / vision_encoder -> stem
-        renamed_state = {}
-        for key, value in loaded_state.items():
-            if key.startswith("backbone.") or key.startswith("vision_encoder."):
-                new_key = "stem." + key.split(".", 1)[1]
-            else:
-                new_key = key
-            renamed_state[new_key] = value
-        loaded_state = renamed_state
+        loaded_state = rename_legacy_checkpoint_keys(loaded_state)
 
         reset_keys = []
         if args.reset_trajectory_head_on_resume:
@@ -502,6 +508,7 @@ def main() -> None:
             args.segmentation_loss_weight * aux_scale if args.use_segmentation_head else 0.0
         )
         running_loss = 0.0
+        running_ade_loss = 0.0
         running_xy_loss = 0.0
         running_heading_loss = 0.0
         running_fde_loss = 0.0
@@ -528,6 +535,7 @@ def main() -> None:
                 time_weights=time_weights,
                 heading_weight=args.heading_weight,
                 fde_weight=args.fde_weight,
+                ade_weight=args.ade_weight,
             )
             weighted_depth_loss = torch.tensor(0.0, device=device)
             weighted_segmentation_loss = torch.tensor(0.0, device=device)
@@ -558,6 +566,7 @@ def main() -> None:
             batch_size = camera.size(0)
             total_samples += batch_size
             running_loss += loss_metrics["loss"] * batch_size
+            running_ade_loss += loss_metrics["ade_loss"] * batch_size
             running_xy_loss += loss_metrics["xy_loss"] * batch_size
             running_heading_loss += loss_metrics["heading_loss"] * batch_size
             running_fde_loss += loss_metrics["fde_loss"] * batch_size
@@ -569,6 +578,7 @@ def main() -> None:
             )
             progress.set_postfix(
                 loss=f"{running_loss / total_samples:.4f}",
+                ade=f"{running_ade_loss / total_samples:.4f}",
                 xy=f"{running_xy_loss / total_samples:.4f}",
                 fde=f"{running_fde_loss / total_samples:.4f}",
                 auxd=f"{running_weighted_depth_loss / total_samples:.4f}",
@@ -578,6 +588,7 @@ def main() -> None:
         scheduler.step()
         train_stats = {
             "loss": running_loss / total_samples,
+            "ade_loss": running_ade_loss / total_samples,
             "xy_loss": running_xy_loss / total_samples,
             "heading_loss": running_heading_loss / total_samples,
             "fde_loss": running_fde_loss / total_samples,
@@ -593,6 +604,7 @@ def main() -> None:
             time_weights=time_weights,
             heading_weight=args.heading_weight,
             fde_weight=args.fde_weight,
+            ade_weight=args.ade_weight,
             depth_loss_weight=effective_depth_weight,
             segmentation_loss_weight=effective_segmentation_weight,
         )
@@ -600,6 +612,7 @@ def main() -> None:
             "epoch": epoch,
             "aux_scale": aux_scale,
             "train_loss": train_stats["loss"],
+            "train_ade_loss": train_stats["ade_loss"],
             "train_xy_loss": train_stats["xy_loss"],
             "train_heading_loss": train_stats["heading_loss"],
             "train_fde_loss": train_stats["fde_loss"],
@@ -608,6 +621,7 @@ def main() -> None:
             "train_weighted_depth_loss": train_stats["weighted_depth_loss"],
             "train_weighted_segmentation_loss": train_stats["weighted_segmentation_loss"],
             "val_loss": val_stats["loss"],
+            "val_ade_loss": val_stats["ade_loss"],
             "val_xy_loss": val_stats["xy_loss"],
             "val_heading_loss": val_stats["heading_loss"],
             "val_fde_loss": val_stats["fde_loss"],
@@ -625,11 +639,13 @@ def main() -> None:
         print(
             f"Epoch {epoch:02d} | "
             f"train_loss={train_stats['loss']:.4f} | "
+            f"train_ade={train_stats['ade_loss']:.4f} | "
             f"train_xy={train_stats['xy_loss']:.4f} | "
             f"train_fde={train_stats['fde_loss']:.4f} | "
             f"train_auxd={train_stats['weighted_depth_loss']:.4f} | "
             f"train_auxs={train_stats['weighted_segmentation_loss']:.4f} | "
             f"val_loss={val_stats['loss']:.4f} | "
+            f"val_ade_loss={val_stats['ade_loss']:.4f} | "
             f"val_xy={val_stats['xy_loss']:.4f} | "
             f"val_fde_loss={val_stats['fde_loss']:.4f} | "
             f"val_auxd={val_stats['weighted_depth_loss']:.4f} | "
@@ -672,6 +688,7 @@ def main() -> None:
             "train_samples": len(train_dataset),
             "val_samples": len(val_dataset),
             "best_epoch": best_state["epoch"],
+            "ade_weight": args.ade_weight,
             "fde_weight": args.fde_weight,
             "depth_loss_weight": args.depth_loss_weight,
             "segmentation_loss_weight": args.segmentation_loss_weight,
