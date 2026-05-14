@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import argparse
 import copy
+from pathlib import Path
 
+import pandas as pd
 import torch
 import torch.nn.functional as torch_f
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from src.data import DrivingDataset, list_pickle_files
+from src.data import DrivingDataset, decode_xy_from_ego, list_pickle_files
 from src.metrics import displacement_errors, depth_loss, segmentation_loss
 from src.model import EgoDrivePlanner
 from src.utils import ensure_dir, get_device, save_json, set_seed
@@ -57,6 +59,12 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-train-samples", type=int, default=None)
     parser.add_argument("--max-val-samples", type=int, default=None)
+    parser.add_argument("--test-dir", default="test_public")
+    parser.add_argument("--max-test-samples", type=int, default=None)
+    parser.add_argument(
+        "--submission-csv-name",
+        default="submission_best_checkpoint.csv",
+    )
     parser.add_argument(
         "--resume",
         default=None,
@@ -189,8 +197,8 @@ def evaluate(
                 heading_weight=heading_weight,
                 fde_weight=fde_weight,
             )
-            weighted_depth_loss = 0.0
-            weighted_segmentation_loss = 0.0
+            weighted_depth_loss = torch.tensor(0.0, device=device)
+            weighted_segmentation_loss = torch.tensor(0.0, device=device)
             if outputs.get("depth") is not None:
                 aux_loss, depth_metrics = depth_loss(outputs["depth"], depth)
                 weighted_depth_loss = depth_loss_weight * aux_loss
@@ -239,6 +247,72 @@ def evaluate(
         "ade": total_ade / total_samples,
         "fde": total_fde / total_samples,
     }
+
+
+def generate_submission(
+    model: EgoDrivePlanner,
+    *,
+    test_dir: str | Path,
+    output_csv: Path,
+    device: torch.device,
+    batch_size: int,
+    num_workers: int,
+    image_height: int,
+    image_width: int,
+    max_test_samples: int | None,
+) -> None:
+    test_files = list_pickle_files(test_dir, max_test_samples)
+    if not test_files:
+        raise RuntimeError(f"No test samples found in {Path(test_dir).expanduser()}")
+
+    dataset = DrivingDataset(
+        test_files,
+        test=True,
+        image_height=image_height,
+        image_width=image_width,
+    )
+    dataloader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=device.type == "cuda",
+    )
+
+    model.eval()
+    predictions = []
+    sample_ids = []
+
+    with torch.no_grad():
+        for batch in tqdm(dataloader, desc="Test inference", leave=False):
+            camera = batch["camera"].to(device)
+            history = batch["history"].to(device)
+            command = batch["command"].to(device)
+            last_pos = batch["last_pos"].to(device)
+            last_heading = batch["last_heading"].to(device)
+
+            outputs = model(camera, history, command)
+            prediction_xy = decode_xy_from_ego(
+                outputs["trajectory"][..., :2],
+                origin_xy=last_pos,
+                origin_heading=last_heading,
+            )
+            predictions.append(prediction_xy.cpu())
+            sample_ids.extend(batch["sample_id"].tolist())
+
+    all_predictions = torch.cat(predictions, dim=0).numpy()
+    flat_predictions = all_predictions.reshape(all_predictions.shape[0], -1)
+
+    column_names = ["id"]
+    for step in range(1, all_predictions.shape[1] + 1):
+        column_names.extend([f"x_{step}", f"y_{step}"])
+
+    submission = pd.DataFrame(flat_predictions)
+    submission.insert(0, "id", sample_ids)
+    submission.columns = column_names
+    submission.to_csv(output_csv, index=False)
+    print(f"Saved submission to {output_csv}")
+    print(f"Submission rows: {len(submission)}, columns: {len(submission.columns)}")
 
 
 def main() -> None:
@@ -603,8 +677,24 @@ def main() -> None:
             "segmentation_loss_weight": args.segmentation_loss_weight,
             "aux_warmup_epochs": args.aux_warmup_epochs,
             "aux_ramp_epochs": args.aux_ramp_epochs,
+            "submission_csv": str(output_dir / args.submission_csv_name),
         },
     )
+
+    model.load_state_dict(best_state["model_state_dict"])
+    submission_path = output_dir / args.submission_csv_name
+    generate_submission(
+        model,
+        test_dir=args.test_dir,
+        output_csv=submission_path,
+        device=device,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        image_height=args.image_height,
+        image_width=args.image_width,
+        max_test_samples=args.max_test_samples,
+    )
+
     print(f"Best checkpoint saved to {output_dir / 'best_checkpoint.pt'}")
     print(f"Best validation ADE: {best_val_ade:.4f}")
 
