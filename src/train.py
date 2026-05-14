@@ -73,7 +73,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--reset-trajectory-head-on-resume",
         action="store_true",
-        help="Drop trajectory decoder/refinement weights when loading a resume checkpoint.",
+        help="Drop newly added planner output/refinement heads when loading a resume checkpoint.",
     )
     return parser
 
@@ -166,6 +166,7 @@ def evaluate(
     fde_weight: float,
     depth_loss_weight: float,
     segmentation_loss_weight: float,
+    aux_token_scale: float,
 ) -> dict[str, float]:
     model.eval()
     total_loss = 0.0
@@ -189,7 +190,12 @@ def evaluate(
             depth = batch["depth"].to(device)
             semantic_label = batch["semantic_label"].to(device)
 
-            outputs = model(camera, history, command)
+            outputs = model(
+                camera,
+                history,
+                command,
+                aux_token_scale=aux_token_scale,
+            )
             loss, metrics = trajectory_objective(
                 outputs["trajectory"],
                 future,
@@ -197,8 +203,8 @@ def evaluate(
                 heading_weight=heading_weight,
                 fde_weight=fde_weight,
             )
-            weighted_depth_loss = 0.0
-            weighted_segmentation_loss = 0.0
+            weighted_depth_loss = torch.tensor(0.0, device=device)
+            weighted_segmentation_loss = torch.tensor(0.0, device=device)
             if outputs.get("depth") is not None:
                 aux_loss, depth_metrics = depth_loss(outputs["depth"], depth)
                 weighted_depth_loss = depth_loss_weight * aux_loss
@@ -440,10 +446,16 @@ def main() -> None:
         reset_keys = []
         if args.reset_trajectory_head_on_resume:
             drop_prefixes = (
-                "trajectory_decoder_cell.",
                 "trajectory_output_head.",
+                "timestep_embedding.",
+                "layer3_token_projection.",
+                "refinement_query_projection.",
+                "refinement_attention.",
                 "trajectory_refinement_decoder.",
                 "trajectory_refinement_head.",
+                "aux_layer4_projection.",
+                "aux_layer3_projection.",
+                "aux_token_projection.",
             )
             filtered_for_reset = {}
             for key, value in loaded_state.items():
@@ -523,7 +535,12 @@ def main() -> None:
             semantic_label = batch["semantic_label"].to(device)
 
             optimizer.zero_grad(set_to_none=True)
-            outputs = model(camera, history_batch, command)
+            outputs = model(
+                camera,
+                history_batch,
+                command,
+                aux_token_scale=aux_scale,
+            )
             loss, loss_metrics = trajectory_objective(
                 outputs["trajectory"],
                 future,
@@ -597,6 +614,7 @@ def main() -> None:
             fde_weight=args.fde_weight,
             depth_loss_weight=effective_depth_weight,
             segmentation_loss_weight=effective_segmentation_weight,
+            aux_token_scale=aux_scale,
         )
         epoch_summary = {
             "epoch": epoch,

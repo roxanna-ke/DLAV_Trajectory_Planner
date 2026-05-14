@@ -107,18 +107,32 @@ class EgoDrivePlanner(nn.Module):
         # Lightweight shared auxiliary decoder (like notebook)
         # Gradients flow back to stem, helping backbone learn perception features
         self.aux_decoder = None
+        self.aux_layer4_projection = None
+        self.aux_layer3_projection = None
+        self.aux_token_projection = None
         self.semantic_head = None
         self.depth_head = None
 
         if use_depth_head or use_segmentation_head:
-            self.aux_decoder = nn.Sequential(
-                nn.Conv2d(512, 256, kernel_size=3, padding=1),
-                nn.BatchNorm2d(256),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(256, 128, kernel_size=3, padding=1),
+            self.aux_layer4_projection = nn.Sequential(
+                nn.Conv2d(512, 128, kernel_size=1),
                 nn.BatchNorm2d(128),
                 nn.ReLU(inplace=True),
             )
+            self.aux_layer3_projection = nn.Sequential(
+                nn.Conv2d(256, 128, kernel_size=1),
+                nn.BatchNorm2d(128),
+                nn.ReLU(inplace=True),
+            )
+            self.aux_decoder = nn.Sequential(
+                nn.Conv2d(256, 128, kernel_size=3, padding=1),
+                nn.BatchNorm2d(128),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(128, 128, kernel_size=3, padding=1),
+                nn.BatchNorm2d(128),
+                nn.ReLU(inplace=True),
+            )
+            self.aux_token_projection = nn.Conv2d(128, image_feature_dim, kernel_size=1)
         if use_segmentation_head:
             self.semantic_head = nn.Conv2d(128, num_segmentation_classes, kernel_size=1)
         if use_depth_head:
@@ -129,6 +143,7 @@ class EgoDrivePlanner(nn.Module):
         camera: torch.Tensor,
         history: torch.Tensor,
         command: torch.Tensor,
+        aux_token_scale: float = 1.0,
     ) -> dict[str, torch.Tensor]:
         B, _, H, W = camera.shape
 
@@ -174,10 +189,26 @@ class EgoDrivePlanner(nn.Module):
             pred_steps[..., 2:],
         ], dim=-1)
 
-        # Stage 2: trajectory-aware refinement attends over layer3 spatial tokens.
+        # Stage 2: trajectory-aware refinement attends over layer3 tokens and
+        # auxiliary perception tokens.
         ctx_sequence = ctx.unsqueeze(1).expand(-1, self.future_steps, -1)
         time_sequence = time_features.unsqueeze(0).expand(B, -1, -1)
         spatial_tokens = self.layer3_token_projection(layer3).flatten(2).transpose(1, 2)
+        aux = None
+        if self.aux_decoder is not None:
+            aux_layer4 = self.aux_layer4_projection(fmap)
+            aux_layer4 = torch_f.interpolate(
+                aux_layer4,
+                size=layer3.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+            aux_layer3 = self.aux_layer3_projection(layer3)
+            aux = self.aux_decoder(torch.cat([aux_layer4, aux_layer3], dim=1))
+            if aux_token_scale > 0.0:
+                aux_tokens = self.aux_token_projection(aux).flatten(2).transpose(1, 2)
+                aux_tokens = aux_tokens * aux_token_scale
+                spatial_tokens = torch.cat([spatial_tokens, aux_tokens], dim=1)
         refinement_query = self.refinement_query_projection(
             torch.cat([coarse_trajectory, ctx_sequence, time_sequence], dim=-1)
         )
@@ -201,7 +232,16 @@ class EgoDrivePlanner(nn.Module):
         # Auxiliary heads: shared feature map → lightweight decoder → upsample
         # Gradients flow back to stem, which is the key mechanism for aux to help planning
         if self.aux_decoder is not None and (self.depth_head is not None or self.semantic_head is not None):
-            aux = self.aux_decoder(fmap)                  # (B, 128, h, w)
+            if aux is None:
+                aux_layer4 = self.aux_layer4_projection(fmap)
+                aux_layer4 = torch_f.interpolate(
+                    aux_layer4,
+                    size=layer3.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                )
+                aux_layer3 = self.aux_layer3_projection(layer3)
+                aux = self.aux_decoder(torch.cat([aux_layer4, aux_layer3], dim=1))
             if self.semantic_head is not None:
                 semantic_logits = self.semantic_head(aux)  # (B, C, h, w)
                 semantic_logits = torch_f.interpolate(
