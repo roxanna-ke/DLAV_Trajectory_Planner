@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as torch_f
@@ -75,10 +77,10 @@ class EgoDrivePlanner(nn.Module):
         # Command embedding
         self.command_embedding = nn.Embedding(3, command_feature_dim)
 
-        # Fusion MLP: concat [global vis, spatial vis, hist, cmd] → context
-        fusion_in = self.vision_dim + self.spatial_feature_dim + history_hidden_dim + command_feature_dim
+        # Base fusion MLP: concat [global vis, hist, cmd] → context
+        base_fusion_in = self.vision_dim + history_hidden_dim + command_feature_dim
         self.context_mlp = nn.Sequential(
-            nn.Linear(fusion_in, 512),
+            nn.Linear(base_fusion_in, 512),
             nn.LayerNorm(512),
             nn.ReLU(inplace=True),
             nn.Dropout(dropout),
@@ -86,6 +88,21 @@ class EgoDrivePlanner(nn.Module):
             nn.LayerNorm(image_feature_dim),
             nn.ReLU(inplace=True),
         )
+        self.spatial_delta_projection = None
+        self.spatial_gate = None
+        if use_layer3_spatial_pooling:
+            self.spatial_delta_projection = nn.Sequential(
+                nn.Linear(self.spatial_feature_dim, image_feature_dim),
+                nn.LayerNorm(image_feature_dim),
+                nn.ReLU(inplace=True),
+            )
+            self.spatial_gate = nn.Linear(base_fusion_in, image_feature_dim)
+            initial_scale = min(max(layer3_spatial_scale, 1e-4), 1.0 - 1e-4)
+            nn.init.zeros_(self.spatial_gate.weight)
+            nn.init.constant_(
+                self.spatial_gate.bias,
+                math.log(initial_scale / (1.0 - initial_scale)),
+            )
 
         # Autoregressive GRU decoder
         self.trajectory_decoder_cell = nn.GRUCell(
@@ -148,12 +165,23 @@ class EgoDrivePlanner(nn.Module):
         _, history_hidden = self.history_encoder(history)
         history_features = history_hidden[-1]
 
-        # Fusion: concat [global vis, spatial vis, hist, cmd] → context vector
-        ctx_input = torch.cat(
-            [vis_global, vis_spatial, history_features, command_features],
+        # Base fusion: concat [global vis, hist, cmd] → context vector
+        ctx_base_input = torch.cat(
+            [vis_global, history_features, command_features],
             dim=1,
         )
-        ctx = self.context_mlp(ctx_input)
+        ctx_base = self.context_mlp(ctx_base_input)
+        ctx = ctx_base
+
+        # Gated residual spatial fusion: ctx = ctx_base + gate * spatial_delta
+        if (
+            self.use_layer3_spatial_pooling
+            and self.spatial_delta_projection is not None
+            and self.spatial_gate is not None
+        ):
+            spatial_delta = self.spatial_delta_projection(vis_spatial)
+            gate = torch.sigmoid(self.spatial_gate(ctx_base_input))
+            ctx = ctx_base + gate * spatial_delta
 
         # Autoregressive GRU decoder
         device = camera.device
