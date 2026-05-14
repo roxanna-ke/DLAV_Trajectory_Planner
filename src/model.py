@@ -30,11 +30,13 @@ class EgoDrivePlanner(nn.Module):
 
         # Vision encoder: ResNet-34 stem (conv layers) + global average pooling
         backbone = resnet34(weights=ResNet34_Weights.DEFAULT if pretrained_backbone else None)
-        self.stem = nn.Sequential(
+        self.stem_layer3 = nn.Sequential(
             backbone.conv1, backbone.bn1, backbone.relu, backbone.maxpool,
-            backbone.layer1, backbone.layer2, backbone.layer3, backbone.layer4,
+            backbone.layer1, backbone.layer2, backbone.layer3,
         )
+        self.stem_layer4 = backbone.layer4
         self.vision_dim = 512
+        self.layer3_dim = 256
         self.global_pool = nn.AdaptiveAvgPool2d((1, 1))
 
         # History encoder: 2-layer GRU
@@ -75,13 +77,25 @@ class EgoDrivePlanner(nn.Module):
         self.aux_decoder = None
         self.semantic_head = None
         self.depth_head = None
+        self.aux_layer3_projection = None
+        self.aux_layer4_projection = None
 
         if use_depth_head or use_segmentation_head:
-            self.aux_decoder = nn.Sequential(
-                nn.Conv2d(512, 256, kernel_size=3, padding=1),
-                nn.BatchNorm2d(256),
+            self.aux_layer3_projection = nn.Sequential(
+                nn.Conv2d(self.layer3_dim, 128, kernel_size=1),
+                nn.BatchNorm2d(128),
                 nn.ReLU(inplace=True),
+            )
+            self.aux_layer4_projection = nn.Sequential(
+                nn.Conv2d(self.vision_dim, 128, kernel_size=1),
+                nn.BatchNorm2d(128),
+                nn.ReLU(inplace=True),
+            )
+            self.aux_decoder = nn.Sequential(
                 nn.Conv2d(256, 128, kernel_size=3, padding=1),
+                nn.BatchNorm2d(128),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(128, 128, kernel_size=3, padding=1),
                 nn.BatchNorm2d(128),
                 nn.ReLU(inplace=True),
             )
@@ -98,8 +112,9 @@ class EgoDrivePlanner(nn.Module):
     ) -> dict[str, torch.Tensor]:
         B, _, H, W = camera.shape
 
-        # Vision: stem → feature map, then global pool → (B, 512)
-        fmap = self.stem(camera)                          # (B, 512, h, w)
+        # Vision: layer3 + layer4 for aux branch, layer4 for planner context
+        layer3 = self.stem_layer3(camera)                 # (B, 256, h3, w3)
+        fmap = self.stem_layer4(layer3)                   # (B, 512, h4, w4)
         vis = self.global_pool(fmap).flatten(1)           # (B, 512)
 
         # FiLM conditioning on command
@@ -137,10 +152,18 @@ class EgoDrivePlanner(nn.Module):
 
         outputs: dict[str, torch.Tensor] = {"trajectory": trajectory}
 
-        # Auxiliary heads: shared feature map → lightweight decoder → upsample
+        # Auxiliary heads: fuse layer3 spatial detail with layer4 semantics
         # Gradients flow back to stem, which is the key mechanism for aux to help planning
         if self.aux_decoder is not None and (self.depth_head is not None or self.semantic_head is not None):
-            aux = self.aux_decoder(fmap)                  # (B, 128, h, w)
+            layer3_aux = self.aux_layer3_projection(layer3)   # (B, 128, h3, w3)
+            layer4_aux = self.aux_layer4_projection(fmap)     # (B, 128, h4, w4)
+            layer4_aux = torch_f.interpolate(
+                layer4_aux,
+                size=layer3_aux.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+            aux = self.aux_decoder(torch.cat([layer3_aux, layer4_aux], dim=1))
             if self.semantic_head is not None:
                 semantic_logits = self.semantic_head(aux)  # (B, C, h, w)
                 semantic_logits = torch_f.interpolate(
