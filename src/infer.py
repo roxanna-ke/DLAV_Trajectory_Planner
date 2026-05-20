@@ -68,13 +68,6 @@ def load_model(
         fusion_heads=config["fusion_heads"],
         dropout=config["dropout"],
         future_steps=config["future_steps"],
-        use_segmentation_head=config.get("use_segmentation_head", False),
-        use_depth_head=config.get("use_depth_head", False),
-        num_segmentation_classes=config["num_segmentation_classes"],
-        use_layer3_spatial_pooling=config.get("use_layer3_spatial_pooling", False),
-        layer3_spatial_scale=config.get("layer3_spatial_scale", 0.1),
-        layer3_spatial_grid_height=config.get("layer3_spatial_grid_height", 4),
-        layer3_spatial_grid_width=config.get("layer3_spatial_grid_width", 6),
     )
     renamed_state = rename_legacy_checkpoint_keys(checkpoint["model_state_dict"])
     load_result = model.load_state_dict(renamed_state, strict=False)

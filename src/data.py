@@ -5,7 +5,6 @@ from pathlib import Path
 from typing import Iterable
 
 import torch
-import torch.nn.functional as torch_f
 from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
@@ -178,42 +177,5 @@ class DrivingDataset(Dataset):
                 origin_xy=last_pos,
                 origin_heading=last_heading,
             )
-            item["depth"] = self._resize_depth_map(data["depth"])
-            item["semantic_label"] = self._resize_segmentation_map(data["semantic_label"])
 
         return item
-
-    def _resize_depth_map(self, depth_map: object) -> torch.Tensor:
-        depth_tensor = torch.as_tensor(depth_map, dtype=torch.float32)
-        if depth_tensor.ndim == 2:
-            depth_tensor = depth_tensor.unsqueeze(0)
-        elif depth_tensor.ndim == 3:
-            depth_tensor = depth_tensor.permute(2, 0, 1)
-        else:
-            raise ValueError(f"Unsupported depth map shape: {tuple(depth_tensor.shape)}")
-
-        resized = torch_f.interpolate(
-            depth_tensor.unsqueeze(0),
-            size=(self.image_height, self.image_width),
-            mode="bilinear",
-            align_corners=False,
-        )
-        return torch.log1p(resized.squeeze(0)) / torch.log1p(torch.tensor(255.0))
-
-    def _resize_segmentation_map(self, segmentation_map: object) -> torch.Tensor:
-        segmentation_tensor = torch.as_tensor(segmentation_map, dtype=torch.float32)
-        if segmentation_tensor.ndim == 2:
-            segmentation_tensor = segmentation_tensor.unsqueeze(0)
-        elif segmentation_tensor.ndim == 3:
-            segmentation_tensor = segmentation_tensor.permute(2, 0, 1)
-        else:
-            raise ValueError(
-                f"Unsupported segmentation map shape: {tuple(segmentation_tensor.shape)}"
-            )
-
-        resized = torch_f.interpolate(
-            segmentation_tensor.unsqueeze(0),
-            size=(self.image_height, self.image_width),
-            mode="nearest",
-        )
-        return resized.squeeze(0).squeeze(0).long()

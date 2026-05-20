@@ -23,6 +23,8 @@ env/
 train/
 val/
 test_public/
+val_real/
+test_public_real/
 dlav-2026-phase-1/
 *.zip
 
@@ -42,3 +44,6 @@ runs/
 
 #notebooks
 notebooks/*.ipynb
+
+docs/
+logs/
