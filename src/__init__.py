@@ -1,2 +1,2 @@
-"""Phase 2/3 trajectory planner with auxiliary perception tasks."""
+"""Phase 3 trajectory planner for sim-to-real generalization."""
 
