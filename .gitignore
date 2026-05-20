@@ -23,6 +23,8 @@ env/
 train/
 val/
 test_public/
+test_public_real/
+val_real/
 dlav-2026-phase-1/
 *.zip
 
@@ -40,5 +42,8 @@ runs/
 .vscode/
 .idea/
 
-#notebooks
-notebooks/*.ipynb
+# Logs
+logs/
+
+# Notebooks (2.4GB with extracted data, zips, __MACOSX)
+notebooks/

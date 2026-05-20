@@ -58,15 +58,11 @@ def load_model(
         pretrained_backbone=False,
         image_feature_dim=config["image_feature_dim"],
         history_hidden_dim=config["history_hidden_dim"],
-        command_feature_dim=config["command_feature_dim"],
         history_layers=config["history_layers"],
         fusion_dim=config["fusion_dim"],
         fusion_heads=config["fusion_heads"],
         dropout=config["dropout"],
         future_steps=config["future_steps"],
-        use_depth_head=config.get("use_depth_head", False),
-        use_segmentation_head=config.get("use_segmentation_head", False),
-        num_segmentation_classes=config["num_segmentation_classes"],
     )
     renamed_state = {}
     for key, value in checkpoint["model_state_dict"].items():
@@ -75,7 +71,15 @@ def load_model(
         else:
             new_key = key
         renamed_state[new_key] = value
-    model.load_state_dict(renamed_state)
+
+    # Filter out keys that no longer exist in the model (command/depth/segmentation)
+    model_state = model.state_dict()
+    filtered_state = {}
+    for key, value in renamed_state.items():
+        if key in model_state and value.shape == model_state[key].shape:
+            filtered_state[key] = value
+
+    model.load_state_dict(filtered_state, strict=False)
     model.to(device)
     model.eval()
     return model, image_height, image_width
@@ -117,11 +121,10 @@ def main() -> None:
         for batch in tqdm(dataloader, desc="Inference", leave=False):
             camera = batch["camera"].to(device)
             history = batch["history"].to(device)
-            command = batch["command"].to(device)
             last_pos = batch["last_pos"].to(device)
             last_heading = batch["last_heading"].to(device)
 
-            outputs = model(camera, history, command)
+            outputs = model(camera, history)
             prediction_xy = decode_xy_from_ego(
                 outputs["trajectory"][..., :2],
                 origin_xy=last_pos,
