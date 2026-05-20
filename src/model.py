@@ -42,15 +42,9 @@ class EgoDrivePlanner(nn.Module):
             dropout=gru_dropout,
         )
 
-        # Command embedding
-        self.command_embedding = nn.Embedding(3, command_feature_dim)
-
-        # FiLM conditioning: command → vision modulation
-        self.film_scale = nn.Linear(command_feature_dim, self.vision_dim)
-        self.film_bias = nn.Linear(command_feature_dim, self.vision_dim)
-
-        # Fusion MLP: concat [vis, hist, cmd] → context
-        fusion_in = self.vision_dim + history_hidden_dim + command_feature_dim
+        # Fusion MLP: concat [vis, hist] -> context.
+        # command_feature_dim is kept in the constructor for old configs/scripts.
+        fusion_in = self.vision_dim + history_hidden_dim
         self.context_mlp = nn.Sequential(
             nn.Linear(fusion_in, 512),
             nn.ReLU(inplace=True),
@@ -103,7 +97,7 @@ class EgoDrivePlanner(nn.Module):
         self,
         camera: torch.Tensor,
         history: torch.Tensor,
-        command: torch.Tensor,
+        command: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         B, _, H, W = camera.shape
 
@@ -112,18 +106,12 @@ class EgoDrivePlanner(nn.Module):
         fmap = self.stem[7](layer3)                       # (B, 512, h, w)
         vis = self.global_pool(fmap).flatten(1)           # (B, 512)
 
-        # FiLM conditioning on command
-        command_features = self.command_embedding(command)
-        scale = torch.sigmoid(self.film_scale(command_features))
-        bias = self.film_bias(command_features)
-        vis = vis * scale + bias
-
         # History encoding
         _, history_hidden = self.history_encoder(history)
         history_features = history_hidden[-1]
 
-        # Fusion: concat [vis, hist, cmd] → context vector
-        ctx = self.context_mlp(torch.cat([vis, history_features, command_features], dim=1))
+        # Fusion: concat [vis, hist] -> context vector
+        ctx = self.context_mlp(torch.cat([vis, history_features], dim=1))
 
         # Stage 1: coarse autoregressive rollout with per-step ctx/time injection.
         device = camera.device

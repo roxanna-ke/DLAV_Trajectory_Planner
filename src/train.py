@@ -157,10 +157,9 @@ def evaluate(
         for batch in dataloader:
             camera = batch["camera"].to(device)
             history = batch["history"].to(device)
-            command = batch["command"].to(device)
             future = batch["future"].to(device)
 
-            outputs = model(camera, history, command)
+            outputs = model(camera, history)
             loss, metrics = trajectory_objective(
                 outputs["trajectory"],
                 future,
@@ -227,11 +226,10 @@ def generate_submission(
         for batch in tqdm(dataloader, desc="Test inference", leave=False):
             camera = batch["camera"].to(device)
             history = batch["history"].to(device)
-            command = batch["command"].to(device)
             last_pos = batch["last_pos"].to(device)
             last_heading = batch["last_heading"].to(device)
 
-            outputs = model(camera, history, command)
+            outputs = model(camera, history)
             prediction_xy = decode_xy_from_ego(
                 outputs["trajectory"][..., :2],
                 origin_xy=last_pos,
@@ -453,11 +451,10 @@ def main() -> None:
         for batch in progress:
             camera = batch["camera"].to(device)
             history_batch = batch["history"].to(device)
-            command = batch["command"].to(device)
             future = batch["future"].to(device)
 
             optimizer.zero_grad(set_to_none=True)
-            outputs = model(camera, history_batch, command)
+            outputs = model(camera, history_batch)
             loss, loss_metrics = trajectory_objective(
                 outputs["trajectory"],
                 future,
