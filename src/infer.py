@@ -70,7 +70,20 @@ def load_model(
         future_steps=config["future_steps"],
     )
     renamed_state = rename_legacy_checkpoint_keys(checkpoint["model_state_dict"])
-    load_result = model.load_state_dict(renamed_state, strict=False)
+    model_state = model.state_dict()
+    filtered_state = {}
+    skipped_keys = []
+    for key, value in renamed_state.items():
+        if key in model_state and value.shape != model_state[key].shape:
+            skipped_keys.append(f"{key}: {value.shape} -> {model_state[key].shape}")
+            continue
+        filtered_state[key] = value
+
+    load_result = model.load_state_dict(filtered_state, strict=False)
+    if skipped_keys:
+        print("Skipped size-mismatched keys:")
+        for skipped_key in skipped_keys:
+            print(f"  {skipped_key}")
     if load_result.missing_keys:
         print(f"Missing keys: {load_result.missing_keys}")
     if load_result.unexpected_keys:
@@ -131,11 +144,10 @@ def main() -> None:
         for batch in tqdm(dataloader, desc="Inference", leave=False):
             camera = batch["camera"].to(device)
             history = batch["history"].to(device)
-            command = batch["command"].to(device)
             last_pos = batch["last_pos"].to(device)
             last_heading = batch["last_heading"].to(device)
 
-            outputs = model(camera, history, command)
+            outputs = model(camera, history)
             prediction_xy = decode_xy_from_ego(
                 outputs["trajectory"][..., :2],
                 origin_xy=last_pos,

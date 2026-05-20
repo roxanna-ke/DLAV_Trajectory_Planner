@@ -10,13 +10,6 @@ from torch.utils.data import Dataset
 from torchvision import transforms
 from torchvision.transforms import InterpolationMode
 
-COMMAND_TO_INDEX = {
-    "forward": 0,
-    "left": 1,
-    "right": 2,
-}
-
-
 def encode_pose_sequence(
     sequence: torch.Tensor,
     *,
@@ -147,7 +140,6 @@ class DrivingDataset(Dataset):
         camera = Image.fromarray(data["camera"])
         camera_tensor = self.camera_transform(camera)
 
-        command = COMMAND_TO_INDEX[data["driving_command"]]
         history_raw = torch.as_tensor(data["sdc_history_feature"], dtype=torch.float32)
         last_pos = history_raw[-1, :2].clone()
         last_heading = history_raw[-1, 2].clone()
@@ -161,7 +153,6 @@ class DrivingDataset(Dataset):
 
         item: dict[str, torch.Tensor | int] = {
             "camera": camera_tensor,
-            "command": torch.tensor(command, dtype=torch.long),
             "history": history,
             "last_pos": last_pos,
             "last_heading": last_heading,
