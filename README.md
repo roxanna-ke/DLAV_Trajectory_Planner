@@ -1,117 +1,142 @@
-# EgoDrive Milestone 1
+# DLAV Trajectory Planner
 
-Milestone 1 implementation for the DLAV 2026 final project. This repository uses the official starter dataset layout downloaded by the course notebook:
+Phase 2 / Phase 3 codebase for the DLAV 2026 final project.
 
-- `train/` with 5000 labeled samples
-- `val/` with 1000 labeled samples
-- `test_public/` with 1000 unlabeled samples
+## Scope
 
-The model follows the Milestone 1 input constraints and only uses:
+This repository contains:
 
-- `camera`
-- `driving_command`
-- `sdc_history_feature`
+- the PyTorch training and inference code used for our later Phase 2 experiments
+- saved experiment metadata inside ignored `outputs/` folders
+- helper scripts for SCITAS / Izar runs
+- an ensemble utility reproducing the final CSV averaging step
 
-`depth` and `semantic_label` are ignored.
+Some cluster launcher scripts in `scripts/` are historical convenience files. For the final reported Phase 2 runs, prefer the commands documented in this README and the hyperparameters saved inside each checkpoint `config`.
 
-## Repository layout
+This repository does not claim full end-to-end reproducibility of the exact best leaderboard model history. The final submission came from resumed finetuning runs, and the exact older code snapshot that originally produced the parent checkpoint is no longer recoverable from git.
+
+## Dataset layout
+
+The official starter notebooks expect:
 
 ```text
-.
-├── src/
-│   ├── data.py
-│   ├── infer.py
-│   ├── metrics.py
-│   ├── model.py
-│   ├── train.py
-│   └── utils.py
-├── train.py
-├── infer.py
-├── notebooks/
-│   └── DLAV_Phase1.ipynb
-├── requirements.txt
-└── README.md
+train/         5000 labeled synthetic samples
+val/           1000 labeled synthetic samples
+test_public/   1000 public test samples
 ```
+
+For Phase 3, the real-domain notebook additionally uses:
+
+```text
+val_real/
+test_public_real/
+```
+
+These folders are ignored by git and should not be committed.
 
 ## Model
 
 The planner uses:
 
-- a pretrained `ResNet` backbone to encode the camera image
-- an embedding for `driving_command`
-- a linear projection for each history step
-- a `GRU` that consumes the fused `camera + command + history` sequence
-- an MLP head that predicts the future `60 x 3` trajectory
+- a pretrained ResNet-34 image backbone
+- a 2-layer GRU history encoder
+- an MLP fusion block for vision and history features
+- an autoregressive GRUCell decoder predicting 60 future steps
 
-At inference time the Kaggle submission keeps only the predicted `x, y` values.
+At submission time only the predicted `x, y` trajectory coordinates are written to CSV.
+
+## Best Phase 2 result
+
+The best Milestone 2 leaderboard submission was an ensemble, not a single checkpoint.
+
+- Final CSV: `outputs/v8_adeloss_3seed_average/submission_mean_4.csv`
+- Ensemble members:
+  - `outputs/v8_seed42_adeloss/submission_best_checkpoint.csv`
+  - `outputs/v8_seed42_adeloss_4/submission_best_checkpoint.csv`
+  - `outputs/v8_seed123_adeloss_5/submission_best_checkpoint.csv`
+  - `outputs/v8_seed3407_adeloss_3/submission_best_checkpoint.csv`
+
+All four runs were finetuned from:
+
+```text
+outputs/aux_from_baseline/best_checkpoint.pt:weights-only
+```
+
+with `--reset-trajectory-head-on-resume`.
+
+## Reproducibility note
+
+What is still reproducible from this repository:
+
+- the current training code in `src/`
+- the exact hyperparameters saved inside the released finetune checkpoints
+- the exact inference procedure
+- the exact ensemble averaging step
+
+What is not fully reproducible anymore:
+
+- the exact older code version that originally produced `outputs/aux_from_baseline/best_checkpoint.pt`
+
+For submission, the correct thing to do is to state this explicitly. It is better to be honest about partial reproducibility than to provide a misleading “from scratch” claim.
 
 ## Environment
-
-Install the core dependencies in your environment:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-If you want pretrained ImageNet weights and they are not cached yet, PyTorch will download them the first time you train without `--no-pretrained`.
+## Training
 
-## Data
-
-Use the data downloaded by the official notebook, so that the repository contains:
-
-```text
-train/
-val/
-test_public/
-```
-
-The older `dlav-2026-phase-1/` Kaggle subset is not used by the scripts.
-
-## Train
-
-Example training command:
+Example training command for Phase 3 (real-domain data, no depth/segmentation/command):
 
 ```bash
-python train.py \
-  --train-dir train \
-  --val-dir val \
-  --output-dir outputs/phase1_resnet_gru \
-  --backbone resnet18 \
-  --epochs 15 \
-  --batch-size 32
+python -m src.train \
+  --train-dir val_real \
+  --val-dir val_real \
+  --test-dir test_public_real \
+  --output-dir outputs/v8_phase3 \
+  --image-height 224 \
+  --image-width 336 \
+  --image-feature-dim 256 \
+  --history-hidden-dim 128 \
+  --history-layers 2 \
+  --fusion-dim 256 \
+  --fusion-heads 4 \
+  --dropout 0.1 \
+  --batch-size 16 \
+  --num-workers 4 \
+  --epochs 50 \
+  --lr 9e-5 \
+  --backbone-lr 1e-5 \
+  --weight-decay 1e-4 \
+  --heading-weight 0.05 \
+  --fde-weight 0.15 \
+  --ade-weight 1.23 \
+  --time-weight-start 1.0 \
+  --time-weight-end 1.4 \
+  --seed 42 \
+  --submission-csv-name submission_best_checkpoint.csv
 ```
 
-Useful options:
-
-- `--freeze-backbone` freezes the ResNet encoder
-- `--no-pretrained` disables ImageNet initialization
-- `--max-train-samples` and `--max-val-samples` help with quick sanity checks
-
-The best checkpoint is saved to:
-
-```text
-outputs/phase1_resnet_gru/best_checkpoint.pt
-```
-
-## Kaggle submission
-
-Generate the CSV for leaderboard upload with:
+## Inference
 
 ```bash
-python infer.py \
-  --checkpoint outputs/phase1_resnet_gru/best_checkpoint.pt \
-  --test-dir test_public \
-  --output-csv submission_phase1.csv
+python -m src.infer \
+  --checkpoint outputs/v8_phase3/best_checkpoint.pt \
+  --test-dir test_public_real \
+  --output-csv outputs/v8_phase3/submission_best_checkpoint.csv
 ```
 
-The generated file follows the required format:
+## Ensemble
 
-```text
-id, x_1, y_1, x_2, y_2, ..., x_60, y_60
+To reproduce the final Phase 2 averaging step:
+
+```bash
+python scripts/make_phase2_ensemble.py \
+  outputs/v8_seed42_adeloss/submission_best_checkpoint.csv \
+  outputs/v8_seed42_adeloss_4/submission_best_checkpoint.csv \
+  outputs/v8_seed123_adeloss_5/submission_best_checkpoint.csv \
+  outputs/v8_seed3407_adeloss_3/submission_best_checkpoint.csv \
+  --output outputs/v8_adeloss_3seed_average/submission_mean_4.csv
 ```
 
-## Notes
-
-- The notebook in `notebooks/` is kept as the original course reference.
-- The script entry points are `train.py` and `infer.py`, which call into `src/`.
-- Validation is reported with ADE and FDE, while the training loss uses Smooth L1 on the trajectory with a smaller heading weight.
