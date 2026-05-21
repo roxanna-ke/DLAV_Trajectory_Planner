@@ -11,7 +11,7 @@ from tqdm import tqdm
 
 from src.data import DrivingDataset, decode_xy_from_ego, list_pickle_files
 from src.model import EgoDrivePlanner
-from src.utils import get_device
+from src.utils import get_device, rename_legacy_checkpoint_keys
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -63,16 +63,12 @@ def load_model(
         fusion_heads=config["fusion_heads"],
         dropout=config["dropout"],
         future_steps=config["future_steps"],
+        camera_feature_weight=config.get("camera_feature_weight", 1.0),
+        history_feature_weight=config.get("history_feature_weight", 1.0),
     )
-    renamed_state = {}
-    for key, value in checkpoint["model_state_dict"].items():
-        if key.startswith("backbone.") or key.startswith("vision_encoder."):
-            new_key = "stem." + key.split(".", 1)[1]
-        else:
-            new_key = key
-        renamed_state[new_key] = value
+    renamed_state = rename_legacy_checkpoint_keys(checkpoint["model_state_dict"])
 
-    # Filter out keys that no longer exist in the model (command/depth/segmentation)
+    # Filter out keys that no longer exist in the model or have incompatible shapes.
     model_state = model.state_dict()
     filtered_state = {}
     for key, value in renamed_state.items():
