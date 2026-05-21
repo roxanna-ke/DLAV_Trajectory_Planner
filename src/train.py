@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from src.data import DrivingDataset, decode_xy_from_ego, list_pickle_files
-from src.metrics import ade_loss, displacement_errors, fde_loss
+from src.metrics import displacement_errors
 from src.model import EgoDrivePlanner
 from src.utils import ensure_dir, get_device, rename_legacy_checkpoint_keys, save_json, set_seed
 
@@ -38,6 +38,8 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--fusion-heads", type=int, default=4)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--future-steps", type=int, default=60)
+    parser.add_argument("--camera-feature-weight", type=float, default=1.0)
+    parser.add_argument("--history-feature-weight", type=float, default=1.0)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--epochs", type=int, default=50)
@@ -72,12 +74,21 @@ def build_argparser() -> argparse.ArgumentParser:
 
 
 def freeze_backbone_parameters(model: EgoDrivePlanner) -> None:
-    for parameter in model.stem.parameters():
+    for parameter in model.stem_layer3.parameters():
+        parameter.requires_grad = False
+    for parameter in model.stem_layer4.parameters():
         parameter.requires_grad = False
 
 
 def freeze_backbone_batchnorm(model: EgoDrivePlanner) -> None:
-    for module in model.stem.modules():
+    for module in model.stem_layer3.modules():
+        if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
+            module.eval()
+            if module.weight is not None:
+                module.weight.requires_grad_(False)
+            if module.bias is not None:
+                module.bias.requires_grad_(False)
+    for module in model.stem_layer4.modules():
         if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
             module.eval()
             if module.weight is not None:
@@ -112,11 +123,6 @@ def trajectory_objective(
     prediction_heading = prediction[..., 2:].contiguous()
     target_heading = target[..., 2:].contiguous()
 
-    # Explicit ADE and FDE losses (L2 displacement)
-    ade, ade_metrics = ade_loss(prediction, target)
-    fde, fde_metrics = fde_loss(prediction, target)
-
-    # Smooth-L1 xy loss with time weighting (regularizer)
     xy_residual = torch_f.smooth_l1_loss(
         prediction_xy,
         target_xy,
@@ -124,25 +130,25 @@ def trajectory_objective(
         beta=1.0,
     )
     xy_loss = (xy_residual * time_weights).mean()
-
-    # Smooth-L1 heading loss (regularizer)
     heading_loss = torch_f.smooth_l1_loss(
         prediction_heading,
         target_heading,
         beta=1.0,
     )
+    ade_loss = torch.linalg.norm(prediction_xy - target_xy, dim=-1).mean()
+    fde_loss = torch.linalg.norm(prediction_xy[:, -1] - target_xy[:, -1], dim=-1).mean()
 
     total_loss = (
-        ade_weight * ade
+        ade_weight * ade_loss
         + xy_loss
         + heading_weight * heading_loss
-        + fde_weight * fde
+        + fde_weight * fde_loss
     )
     metrics = {
-        "ade_loss": ade_metrics["ade_loss"],
-        "fde_loss": fde_metrics["fde_loss"],
+        "ade_loss": float(ade_loss.detach().item()),
         "xy_loss": float(xy_loss.detach().item()),
         "heading_loss": float(heading_loss.detach().item()),
+        "fde_loss": float(fde_loss.detach().item()),
         "loss": float(total_loss.detach().item()),
     }
     return total_loss, metrics
@@ -329,6 +335,8 @@ def main() -> None:
         fusion_heads=args.fusion_heads,
         dropout=args.dropout,
         future_steps=args.future_steps,
+        camera_feature_weight=args.camera_feature_weight,
+        history_feature_weight=args.history_feature_weight,
     ).to(device)
 
     if args.freeze_backbone:
@@ -339,7 +347,7 @@ def main() -> None:
     for name, parameter in model.named_parameters():
         if not parameter.requires_grad:
             continue
-        if name.startswith("stem."):
+        if name.startswith("stem_layer3.") or name.startswith("stem_layer4."):
             backbone_parameters.append(parameter)
         else:
             head_parameters.append(parameter)
@@ -387,6 +395,7 @@ def main() -> None:
             drop_prefixes = (
                 "trajectory_decoder_cell.",
                 "trajectory_output_head.",
+                "trajectory_residual_head.",
             )
             filtered_for_reset = {}
             for key, value in loaded_state.items():
@@ -396,7 +405,7 @@ def main() -> None:
                 filtered_for_reset[key] = value
             loaded_state = filtered_for_reset
 
-        # Filter out keys with shape mismatches and keys that no longer exist in the model
+        # Filter out keys that no longer exist in the model and shape mismatches.
         filtered_state = {}
         skipped_keys = []
         for key, value in loaded_state.items():

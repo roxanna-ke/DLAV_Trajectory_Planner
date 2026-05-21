@@ -5,7 +5,6 @@ from pathlib import Path
 from typing import Iterable
 
 import torch
-import torch.nn.functional as torch_f
 from PIL import Image
 from torch.utils.data import Dataset
 from torchvision import transforms
@@ -52,6 +51,22 @@ def decode_xy_from_ego(
     return torch.stack([world_x, world_y], dim=-1) + origin_xy
 
 
+class GaussianNoise:
+    """Add additive Gaussian noise to a tensor (applied after Normalize)."""
+
+    def __init__(self, sigma: float = 0.02, p: float = 0.5) -> None:
+        self.sigma = sigma
+        self.p = p
+
+    def __call__(self, tensor: torch.Tensor) -> torch.Tensor:
+        if torch.rand(1).item() < self.p:
+            return tensor + torch.randn_like(tensor) * self.sigma
+        return tensor
+
+    def __repr__(self) -> str:
+        return f"{self.__class__.__name__}(sigma={self.sigma}, p={self.p})"
+
+
 def build_eval_camera_transform(
     image_height: int = 224,
     image_width: int = 336,
@@ -81,17 +96,19 @@ def build_train_camera_transform(
                 (image_height, image_width),
                 interpolation=InterpolationMode.BILINEAR,
             ),
-            transforms.ToTensor(),
             transforms.ColorJitter(
-                brightness=0.2,
-                contrast=0.2,
+                brightness=0.3,
+                contrast=0.25,
                 saturation=0.2,
                 hue=0.05,
             ),
+            transforms.ToTensor(),
             transforms.Normalize(
                 mean=[0.485, 0.456, 0.406],
                 std=[0.229, 0.224, 0.225],
             ),
+            GaussianNoise(sigma=0.02, p=0.5),
+            transforms.RandomErasing(p=0.3, scale=(0.02, 0.08), ratio=(0.3, 3.3)),
         ]
     )
 

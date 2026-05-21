@@ -17,9 +17,13 @@ class EgoDrivePlanner(nn.Module):
         fusion_heads: int = 4,
         dropout: float = 0.1,
         future_steps: int = 60,
+        camera_feature_weight: float = 1.0,
+        history_feature_weight: float = 1.0,
     ) -> None:
         super().__init__()
         self.future_steps = future_steps
+        self.camera_feature_weight = camera_feature_weight
+        self.history_feature_weight = history_feature_weight
 
         # Vision encoder: ResNet-34 stem (conv layers) + global average pooling
         backbone = resnet34(weights=ResNet34_Weights.DEFAULT if pretrained_backbone else None)
@@ -41,7 +45,7 @@ class EgoDrivePlanner(nn.Module):
             dropout=gru_dropout,
         )
 
-        # Fusion MLP: concat [vis, hist] → context
+        # Fusion MLP: concat [vis, hist] -> context
         fusion_in = self.vision_dim + history_hidden_dim
         self.context_mlp = nn.Sequential(
             nn.Linear(fusion_in, 512),
@@ -51,18 +55,20 @@ class EgoDrivePlanner(nn.Module):
             nn.ReLU(inplace=True),
         )
 
-        # Autoregressive GRU decoder
-        self.trajectory_decoder_cell = nn.GRUCell(
-            input_size=4, hidden_size=image_feature_dim,
+        # Direct residual decoder: constant-velocity prior + learned correction.
+        self.trajectory_residual_head = nn.Sequential(
+            nn.Linear(image_feature_dim, image_feature_dim),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(image_feature_dim, future_steps * 4),
         )
-        self.trajectory_output_head = nn.Linear(image_feature_dim, 4)
 
     def forward(
         self,
         camera: torch.Tensor,
         history: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        B, _, H, W = camera.shape
+        B = camera.size(0)
 
         # Vision: layer3 + layer4 + global pool
         layer3 = self.stem_layer3(camera)                 # (B, 256, h3, w3)
@@ -73,28 +79,39 @@ class EgoDrivePlanner(nn.Module):
         _, history_hidden = self.history_encoder(history)
         history_features = history_hidden[-1]
 
-        # Fusion: concat [vis, hist] → context vector
-        ctx = self.context_mlp(torch.cat([vis, history_features], dim=1))
+        # Fusion: concat [vis, hist] -> context vector
+        ctx = self.context_mlp(
+            torch.cat(
+                [
+                    vis * self.camera_feature_weight,
+                    history_features * self.history_feature_weight,
+                ],
+                dim=1,
+            )
+        )
 
-        # Autoregressive GRU decoder
-        device = camera.device
-        h_dec = ctx
-        step_input = torch.zeros(B, 4, device=device)
-        step_outputs = []
-        for _ in range(self.future_steps):
-            h_dec = self.trajectory_decoder_cell(step_input, h_dec)
-            step_out = self.trajectory_output_head(h_dec)
-            step_outputs.append(step_out)
-            step_input = step_out
+        residual = self.trajectory_residual_head(ctx).view(B, self.future_steps, 4)
 
-        # Stack: (B, T, 4) where 4 = [dx, dy, sin(heading), cos(heading)]
-        pred_steps = torch.stack(step_outputs, dim=1)
-        # Cumsum on xy deltas to get absolute relative positions
-        # Heading sin/cos are predicted as absolute values (not deltas)
-        trajectory = torch.cat([
-            torch.cumsum(pred_steps[..., :2], dim=1),
-            pred_steps[..., 2:],
-        ], dim=-1)
+        # The encoded history is in the current ego frame, so the last xy is near zero.
+        # Use a short moving average of recent velocity as a stable future prior.
+        history_velocity = history[:, 1:, :2] - history[:, :-1, :2]
+        recent_velocity = history_velocity[:, -5:].mean(dim=1)
+        steps = torch.arange(
+            1,
+            self.future_steps + 1,
+            device=history.device,
+            dtype=history.dtype,
+        ).view(1, self.future_steps, 1)
+        xy_prior = steps * recent_velocity.unsqueeze(1)
+
+        # Residual xy corrects the kinematic prior; heading is predicted directly.
+        trajectory = torch.cat(
+            [
+                xy_prior + residual[..., :2],
+                residual[..., 2:],
+            ],
+            dim=-1,
+        )
 
         outputs: dict[str, torch.Tensor] = {"trajectory": trajectory}
         return outputs
