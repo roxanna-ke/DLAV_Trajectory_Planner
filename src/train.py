@@ -11,7 +11,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from src.data import DrivingDataset, decode_xy_from_ego, list_pickle_files
-from src.metrics import displacement_errors
+from src.metrics import ade_loss, displacement_errors, fde_loss
 from src.model import EgoDrivePlanner
 from src.utils import ensure_dir, get_device, rename_legacy_checkpoint_keys, save_json, set_seed
 
@@ -112,6 +112,11 @@ def trajectory_objective(
     prediction_heading = prediction[..., 2:].contiguous()
     target_heading = target[..., 2:].contiguous()
 
+    # Explicit ADE and FDE losses (L2 displacement)
+    ade, ade_metrics = ade_loss(prediction, target)
+    fde, fde_metrics = fde_loss(prediction, target)
+
+    # Smooth-L1 xy loss with time weighting (regularizer)
     xy_residual = torch_f.smooth_l1_loss(
         prediction_xy,
         target_xy,
@@ -119,25 +124,25 @@ def trajectory_objective(
         beta=1.0,
     )
     xy_loss = (xy_residual * time_weights).mean()
+
+    # Smooth-L1 heading loss (regularizer)
     heading_loss = torch_f.smooth_l1_loss(
         prediction_heading,
         target_heading,
         beta=1.0,
     )
-    ade_loss = torch.linalg.norm(prediction_xy - target_xy, dim=-1).mean()
-    fde_loss = torch.linalg.norm(prediction_xy[:, -1] - target_xy[:, -1], dim=-1).mean()
 
     total_loss = (
-        ade_weight * ade_loss
+        ade_weight * ade
         + xy_loss
         + heading_weight * heading_loss
-        + fde_weight * fde_loss
+        + fde_weight * fde
     )
     metrics = {
-        "ade_loss": float(ade_loss.detach().item()),
+        "ade_loss": ade_metrics["ade_loss"],
+        "fde_loss": fde_metrics["fde_loss"],
         "xy_loss": float(xy_loss.detach().item()),
         "heading_loss": float(heading_loss.detach().item()),
-        "fde_loss": float(fde_loss.detach().item()),
         "loss": float(total_loss.detach().item()),
     }
     return total_loss, metrics

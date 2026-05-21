@@ -3,6 +3,30 @@ from __future__ import annotations
 import torch
 
 
+def ade_loss(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Average Displacement Error: mean L2 distance over all predicted waypoints."""
+    prediction_xy = prediction[..., :2].contiguous()
+    target_xy = target[..., :2].contiguous()
+    loss = torch.linalg.norm(prediction_xy - target_xy, dim=-1).mean()
+    metrics = {"ade_loss": float(loss.detach().item())}
+    return loss, metrics
+
+
+def fde_loss(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Final Displacement Error: L2 distance at the last predicted waypoint."""
+    prediction_xy = prediction[..., :2].contiguous()
+    target_xy = target[..., :2].contiguous()
+    loss = torch.linalg.norm(prediction_xy[:, -1] - target_xy[:, -1], dim=-1).mean()
+    metrics = {"fde_loss": float(loss.detach().item())}
+    return loss, metrics
+
+
 def displacement_errors(
     prediction: torch.Tensor,
     target: torch.Tensor,
