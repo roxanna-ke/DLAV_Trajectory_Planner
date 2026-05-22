@@ -55,13 +55,30 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--max-train-samples", type=int, default=None)
     parser.add_argument("--max-val-samples", type=int, default=None)
     parser.add_argument(
-        "--val-train-fraction",
-        type=float,
-        default=0.0,
+        "--real-dir",
+        default=None,
         help=(
-            "Fraction of files from --val-dir to mix into training. "
-            "The remaining --val-dir files are kept for validation."
+            "Optional labeled real-domain directory. When set, this directory "
+            "is split into real train/validation subsets; the real train subset "
+            "is oversampled into training and the real validation subset is used "
+            "for checkpoint selection."
         ),
+    )
+    parser.add_argument("--max-real-samples", type=int, default=None)
+    parser.add_argument(
+        "--real-val-fraction",
+        type=float,
+        default=0.2,
+        help=(
+            "Fraction of --real-dir to reserve as held-out real validation. "
+            "Only used when --real-dir is set."
+        ),
+    )
+    parser.add_argument(
+        "--real-oversample",
+        type=int,
+        default=4,
+        help="Repeat the real train split this many times in the training set.",
     )
     parser.add_argument("--test-dir", default="test_public")
     parser.add_argument("--max-test-samples", type=int, default=None)
@@ -118,39 +135,31 @@ def build_time_weights(
     return weights / weights.mean()
 
 
-def split_val_files_for_training(
-    val_files: list[Path],
+def split_real_files(
+    real_files: list[Path],
     *,
-    train_fraction: float,
+    val_fraction: float,
     seed: int,
 ) -> tuple[list[Path], list[Path]]:
-    if not 0.0 <= train_fraction < 1.0:
-        raise ValueError("--val-train-fraction must be in the range [0.0, 1.0).")
-    if train_fraction == 0.0 or not val_files:
-        return [], val_files
+    if not 0.0 < val_fraction < 1.0:
+        raise ValueError("--real-val-fraction must be in the range (0.0, 1.0).")
+    if len(real_files) < 2:
+        raise ValueError("--real-dir must contain at least two samples to split.")
 
-    val_count = len(val_files)
-    train_count = int(val_count * train_fraction)
-    if train_count == 0:
-        raise ValueError(
-            "--val-train-fraction is too small for the number of validation files; "
-            "increase it or leave it at 0.0."
-        )
-
-    # Keep at least one held-out validation sample for checkpoint selection.
-    train_count = min(train_count, val_count - 1)
+    val_count = max(1, int(len(real_files) * val_fraction))
+    val_count = min(val_count, len(real_files) - 1)
     generator = torch.Generator().manual_seed(seed)
-    permutation = torch.randperm(val_count, generator=generator).tolist()
-    train_indices = set(permutation[:train_count])
+    permutation = torch.randperm(len(real_files), generator=generator).tolist()
+    val_indices = set(permutation[:val_count])
 
-    val_train_files = []
-    val_holdout_files = []
-    for index, path in enumerate(val_files):
-        if index in train_indices:
-            val_train_files.append(path)
+    real_train_files = []
+    real_val_files = []
+    for index, path in enumerate(real_files):
+        if index in val_indices:
+            real_val_files.append(path)
         else:
-            val_holdout_files.append(path)
-    return val_train_files, val_holdout_files
+            real_train_files.append(path)
+    return real_train_files, real_val_files
 
 
 def trajectory_objective(
@@ -339,30 +348,53 @@ def main() -> None:
 
     output_dir = ensure_dir(args.output_dir)
 
-    train_files = list_pickle_files(args.train_dir, args.max_train_samples)
-    val_files = list_pickle_files(args.val_dir, args.max_val_samples)
-    val_train_files, val_files = split_val_files_for_training(
-        val_files,
-        train_fraction=args.val_train_fraction,
-        seed=args.seed,
-    )
-    train_files = train_files + val_train_files
+    if args.real_oversample < 1:
+        raise ValueError("--real-oversample must be at least 1.")
+
+    synthetic_train_files = list_pickle_files(args.train_dir, args.max_train_samples)
+    real_train_files: list[Path] = []
+    real_val_files: list[Path] = []
+
+    if args.real_dir is None:
+        val_files = list_pickle_files(args.val_dir, args.max_val_samples)
+        train_files = synthetic_train_files
+    else:
+        real_files = list_pickle_files(args.real_dir, args.max_real_samples)
+        if not real_files:
+            raise RuntimeError(f"No real samples found in {Path(args.real_dir).expanduser()}")
+        real_train_files, real_val_files = split_real_files(
+            real_files,
+            val_fraction=args.real_val_fraction,
+            seed=args.seed,
+        )
+        train_files = synthetic_train_files + real_train_files * args.real_oversample
+        val_files = real_val_files
+
     if not train_files:
         raise RuntimeError(
-            f"No training samples found in {Path(args.train_dir).expanduser()}"
+            "No training samples found. Check --train-dir, --max-train-samples, "
+            "and --real-dir."
         )
     if not val_files:
         raise RuntimeError(
-            "No validation samples left after splitting --val-dir. "
-            "Use a smaller --val-train-fraction."
+            "No validation samples found. Check --val-dir or the --real-dir split."
         )
 
-    print(
-        "Dataset split | "
-        f"train_dir_samples={len(train_files) - len(val_train_files)} | "
-        f"val_mixed_into_train={len(val_train_files)} | "
-        f"heldout_val_samples={len(val_files)}"
-    )
+    if args.real_dir is None:
+        print(
+            "Dataset split | "
+            f"synthetic_train_samples={len(synthetic_train_files)} | "
+            f"heldout_val_samples={len(val_files)}"
+        )
+    else:
+        print(
+            "Dataset split | "
+            f"synthetic_train_samples={len(synthetic_train_files)} | "
+            f"real_train_unique_samples={len(real_train_files)} | "
+            f"real_oversample={args.real_oversample} | "
+            f"epoch_train_samples={len(train_files)} | "
+            f"real_holdout_val_samples={len(val_files)}"
+        )
 
     train_dataset = DrivingDataset(
         train_files,
@@ -633,9 +665,13 @@ def main() -> None:
             "epochs": args.epochs,
             "train_samples": len(train_dataset),
             "val_samples": len(val_dataset),
-            "train_dir_samples": len(train_files) - len(val_train_files),
-            "val_mixed_into_train_samples": len(val_train_files),
-            "val_train_fraction": args.val_train_fraction,
+            "synthetic_train_samples": len(synthetic_train_files),
+            "real_dir": args.real_dir,
+            "real_train_unique_samples": len(real_train_files),
+            "real_train_oversampled_samples": len(real_train_files) * args.real_oversample,
+            "real_val_samples": len(real_val_files),
+            "real_val_fraction": args.real_val_fraction if args.real_dir is not None else None,
+            "real_oversample": args.real_oversample if args.real_dir is not None else None,
             "best_epoch": best_state["epoch"],
             "ade_weight": args.ade_weight,
             "fde_weight": args.fde_weight,
