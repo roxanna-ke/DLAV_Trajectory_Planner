@@ -54,6 +54,15 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-train-samples", type=int, default=None)
     parser.add_argument("--max-val-samples", type=int, default=None)
+    parser.add_argument(
+        "--val-train-fraction",
+        type=float,
+        default=0.0,
+        help=(
+            "Fraction of files from --val-dir to mix into training. "
+            "The remaining --val-dir files are kept for validation."
+        ),
+    )
     parser.add_argument("--test-dir", default="test_public")
     parser.add_argument("--max-test-samples", type=int, default=None)
     parser.add_argument(
@@ -107,6 +116,41 @@ def build_time_weights(
     weights = torch.linspace(start, end, future_steps, device=device)
     weights = weights.view(1, future_steps, 1)
     return weights / weights.mean()
+
+
+def split_val_files_for_training(
+    val_files: list[Path],
+    *,
+    train_fraction: float,
+    seed: int,
+) -> tuple[list[Path], list[Path]]:
+    if not 0.0 <= train_fraction < 1.0:
+        raise ValueError("--val-train-fraction must be in the range [0.0, 1.0).")
+    if train_fraction == 0.0 or not val_files:
+        return [], val_files
+
+    val_count = len(val_files)
+    train_count = int(val_count * train_fraction)
+    if train_count == 0:
+        raise ValueError(
+            "--val-train-fraction is too small for the number of validation files; "
+            "increase it or leave it at 0.0."
+        )
+
+    # Keep at least one held-out validation sample for checkpoint selection.
+    train_count = min(train_count, val_count - 1)
+    generator = torch.Generator().manual_seed(seed)
+    permutation = torch.randperm(val_count, generator=generator).tolist()
+    train_indices = set(permutation[:train_count])
+
+    val_train_files = []
+    val_holdout_files = []
+    for index, path in enumerate(val_files):
+        if index in train_indices:
+            val_train_files.append(path)
+        else:
+            val_holdout_files.append(path)
+    return val_train_files, val_holdout_files
 
 
 def trajectory_objective(
@@ -297,6 +341,28 @@ def main() -> None:
 
     train_files = list_pickle_files(args.train_dir, args.max_train_samples)
     val_files = list_pickle_files(args.val_dir, args.max_val_samples)
+    val_train_files, val_files = split_val_files_for_training(
+        val_files,
+        train_fraction=args.val_train_fraction,
+        seed=args.seed,
+    )
+    train_files = train_files + val_train_files
+    if not train_files:
+        raise RuntimeError(
+            f"No training samples found in {Path(args.train_dir).expanduser()}"
+        )
+    if not val_files:
+        raise RuntimeError(
+            "No validation samples left after splitting --val-dir. "
+            "Use a smaller --val-train-fraction."
+        )
+
+    print(
+        "Dataset split | "
+        f"train_dir_samples={len(train_files) - len(val_train_files)} | "
+        f"val_mixed_into_train={len(val_train_files)} | "
+        f"heldout_val_samples={len(val_files)}"
+    )
 
     train_dataset = DrivingDataset(
         train_files,
@@ -567,6 +633,9 @@ def main() -> None:
             "epochs": args.epochs,
             "train_samples": len(train_dataset),
             "val_samples": len(val_dataset),
+            "train_dir_samples": len(train_files) - len(val_train_files),
+            "val_mixed_into_train_samples": len(val_train_files),
+            "val_train_fraction": args.val_train_fraction,
             "best_epoch": best_state["epoch"],
             "ade_weight": args.ade_weight,
             "fde_weight": args.fde_weight,
