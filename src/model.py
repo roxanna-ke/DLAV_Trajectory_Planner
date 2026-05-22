@@ -55,12 +55,16 @@ class EgoDrivePlanner(nn.Module):
             nn.ReLU(inplace=True),
         )
 
-        # Direct residual decoder: constant-velocity prior + learned correction.
-        self.trajectory_residual_head = nn.Sequential(
+        # Autoregressive trajectory decoder, following TransFuser's waypoint GRU style.
+        self.trajectory_decoder_cell = nn.GRUCell(
+            input_size=4,
+            hidden_size=image_feature_dim,
+        )
+        self.trajectory_output_head = nn.Sequential(
             nn.Linear(image_feature_dim, image_feature_dim),
             nn.ReLU(inplace=True),
             nn.Dropout(dropout),
-            nn.Linear(image_feature_dim, future_steps * 4),
+            nn.Linear(image_feature_dim, 4),
         )
 
     def forward(
@@ -90,28 +94,32 @@ class EgoDrivePlanner(nn.Module):
             )
         )
 
-        residual = self.trajectory_residual_head(ctx).view(B, self.future_steps, 4)
-
         # The encoded history is in the current ego frame, so the last xy is near zero.
-        # Use a short moving average of recent velocity as a stable future prior.
+        # Use a short moving average of recent velocity as a stable per-step prior.
         history_velocity = history[:, 1:, :2] - history[:, :-1, :2]
         recent_velocity = history_velocity[:, -5:].mean(dim=1)
-        steps = torch.arange(
-            1,
-            self.future_steps + 1,
+
+        decoder_hidden = ctx
+        decoder_input = torch.zeros(
+            B,
+            4,
             device=history.device,
             dtype=history.dtype,
-        ).view(1, self.future_steps, 1)
-        xy_prior = steps * recent_velocity.unsqueeze(1)
-
-        # Residual xy corrects the kinematic prior; heading is predicted directly.
-        trajectory = torch.cat(
-            [
-                xy_prior + residual[..., :2],
-                residual[..., 2:],
-            ],
-            dim=-1,
         )
+        decoder_input[:, 3] = 1.0
+        xy = decoder_input[:, :2]
+        trajectory_steps = []
+
+        for _ in range(self.future_steps):
+            decoder_hidden = self.trajectory_decoder_cell(decoder_input, decoder_hidden)
+            step_output = self.trajectory_output_head(decoder_hidden)
+
+            xy = xy + recent_velocity + step_output[:, :2]
+            heading = step_output[:, 2:]
+            decoder_input = torch.cat([xy, heading], dim=1)
+            trajectory_steps.append(decoder_input)
+
+        trajectory = torch.stack(trajectory_steps, dim=1)
 
         outputs: dict[str, torch.Tensor] = {"trajectory": trajectory}
         return outputs
