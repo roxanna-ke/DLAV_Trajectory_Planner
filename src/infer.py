@@ -62,7 +62,6 @@ def load_model(
         pretrained_backbone=False,
         image_feature_dim=config["image_feature_dim"],
         history_hidden_dim=config["history_hidden_dim"],
-        command_feature_dim=config["command_feature_dim"],
         history_layers=config["history_layers"],
         fusion_dim=config["fusion_dim"],
         fusion_heads=config["fusion_heads"],

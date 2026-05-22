@@ -7,18 +7,23 @@ from pathlib import Path
 import pandas as pd
 import torch
 import torch.nn.functional as torch_f
-from torch.utils.data import DataLoader
+from torch.utils.data import ConcatDataset, DataLoader
 from tqdm import tqdm
 
-from src.data import DrivingDataset, decode_xy_from_ego, list_pickle_files
+from src.data import (
+    DrivingDataset,
+    compute_real_style_stats,
+    decode_xy_from_ego,
+    list_pickle_files,
+)
 from src.metrics import displacement_errors
 from src.model import EgoDrivePlanner
-from src.utils import ensure_dir, get_device, save_json, set_seed
+from src.utils import ensure_dir, get_device, rename_legacy_checkpoint_keys, save_json, set_seed
 
 
 def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Train the trajectory planner with coarse-to-fine refinement."
+        description="Train the spatial-attention trajectory planner."
     )
     parser.add_argument("--train-dir", default="~/data/DLAV/train")
     parser.add_argument("--val-dir", default="~/data/DLAV/val")
@@ -33,7 +38,6 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--image-width", type=int, default=336)
     parser.add_argument("--image-feature-dim", type=int, default=256)
     parser.add_argument("--history-hidden-dim", type=int, default=128)
-    parser.add_argument("--command-feature-dim", type=int, default=32)
     parser.add_argument("--history-layers", type=int, default=2)
     parser.add_argument("--fusion-dim", type=int, default=256)
     parser.add_argument("--fusion-heads", type=int, default=4)
@@ -46,12 +50,17 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--backbone-lr", type=float, default=5e-5)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--heading-weight", type=float, default=0.1)
-    parser.add_argument("--fde-weight", type=float, default=0.15)
+    parser.add_argument("--fde-weight", type=float, default=1.0)
     parser.add_argument("--time-weight-start", type=float, default=1.0)
     parser.add_argument("--time-weight-end", type=float, default=2.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-train-samples", type=int, default=None)
     parser.add_argument("--max-val-samples", type=int, default=None)
+    parser.add_argument("--real-dir", default=None)
+    parser.add_argument("--max-real-samples", type=int, default=None)
+    parser.add_argument("--real-val-fraction", type=float, default=0.5)
+    parser.add_argument("--real-oversample", type=int, default=1)
+    parser.add_argument("--style-stat-samples", type=int, default=200)
     parser.add_argument("--test-dir", default="test_public")
     parser.add_argument("--max-test-samples", type=int, default=None)
     parser.add_argument(
@@ -66,24 +75,27 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--reset-trajectory-head-on-resume",
         action="store_true",
-        help="Drop trajectory output/refinement heads when loading a resume checkpoint.",
+        help="Drop trajectory decoder/output head weights when loading a resume checkpoint.",
     )
     return parser
 
 
 def freeze_backbone_parameters(model: EgoDrivePlanner) -> None:
-    for parameter in model.stem.parameters():
+    for parameter in model.stem_layer3.parameters():
+        parameter.requires_grad = False
+    for parameter in model.stem_layer4.parameters():
         parameter.requires_grad = False
 
 
 def freeze_backbone_batchnorm(model: EgoDrivePlanner) -> None:
-    for module in model.stem.modules():
-        if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
-            module.eval()
-            if module.weight is not None:
-                module.weight.requires_grad_(False)
-            if module.bias is not None:
-                module.bias.requires_grad_(False)
+    for stem in (model.stem_layer3, model.stem_layer4):
+        for module in stem.modules():
+            if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
+                module.eval()
+                if module.weight is not None:
+                    module.weight.requires_grad_(False)
+                if module.bias is not None:
+                    module.bias.requires_grad_(False)
 
 
 def build_time_weights(
@@ -123,10 +135,12 @@ def trajectory_objective(
         target_heading,
         beta=1.0,
     )
+    ade_loss = torch.linalg.norm(prediction_xy - target_xy, dim=-1).mean()
     fde_loss = torch.linalg.norm(prediction_xy[:, -1] - target_xy[:, -1], dim=-1).mean()
 
-    total_loss = xy_loss + heading_weight * heading_loss + fde_weight * fde_loss
+    total_loss = ade_loss + 1.2 * xy_loss + heading_weight * heading_loss + fde_weight * fde_loss
     metrics = {
+        "ade_loss": float(ade_loss.detach().item()),
         "xy_loss": float(xy_loss.detach().item()),
         "heading_loss": float(heading_loss.detach().item()),
         "fde_loss": float(fde_loss.detach().item()),
@@ -146,6 +160,7 @@ def evaluate(
 ) -> dict[str, float]:
     model.eval()
     total_loss = 0.0
+    total_ade_loss = 0.0
     total_xy_loss = 0.0
     total_heading_loss = 0.0
     total_fde_loss = 0.0
@@ -172,6 +187,7 @@ def evaluate(
             batch_size = camera.size(0)
             total_samples += batch_size
             total_loss += loss.item() * batch_size
+            total_ade_loss += metrics["ade_loss"] * batch_size
             total_xy_loss += metrics["xy_loss"] * batch_size
             total_heading_loss += metrics["heading_loss"] * batch_size
             total_fde_loss += metrics["fde_loss"] * batch_size
@@ -180,6 +196,7 @@ def evaluate(
 
     return {
         "loss": total_loss / total_samples,
+        "ade_loss": total_ade_loss / total_samples,
         "xy_loss": total_xy_loss / total_samples,
         "heading_loss": total_heading_loss / total_samples,
         "fde_loss": total_fde_loss / total_samples,
@@ -270,21 +287,82 @@ def main() -> None:
 
     output_dir = ensure_dir(args.output_dir)
 
-    train_files = list_pickle_files(args.train_dir, args.max_train_samples)
-    val_files = list_pickle_files(args.val_dir, args.max_val_samples)
+    if args.real_oversample < 1:
+        raise ValueError("--real-oversample must be at least 1.")
+    if not 0.0 < args.real_val_fraction < 1.0:
+        raise ValueError("--real-val-fraction must be in the range (0.0, 1.0).")
 
-    train_dataset = DrivingDataset(
-        train_files,
-        augment=True,
-        image_height=args.image_height,
-        image_width=args.image_width,
-    )
+    train_files = list_pickle_files(args.train_dir, args.max_train_samples)
+    real_train_files: list[Path] = []
+    real_val_files: list[Path] = []
+
+    if args.real_dir is None:
+        val_files = list_pickle_files(args.val_dir, args.max_val_samples)
+        train_dataset = DrivingDataset(
+            train_files,
+            augment=True,
+            image_height=args.image_height,
+            image_width=args.image_width,
+        )
+    else:
+        real_files = list_pickle_files(args.real_dir, args.max_real_samples)
+        if len(real_files) < 2:
+            raise RuntimeError("--real-dir must contain at least two samples.")
+
+        real_train_count = int(len(real_files) * (1.0 - args.real_val_fraction))
+        real_train_count = min(max(1, real_train_count), len(real_files) - 1)
+        real_train_files = real_files[:real_train_count]
+        real_val_files = real_files[real_train_count:]
+        val_files = real_val_files
+
+        real_style_stats = compute_real_style_stats(
+            real_files,
+            image_height=args.image_height,
+            image_width=args.image_width,
+            max_samples=args.style_stat_samples,
+        )
+        sim_dataset = DrivingDataset(
+            train_files,
+            augment=True,
+            image_height=args.image_height,
+            image_width=args.image_width,
+            style_stats=real_style_stats,
+        )
+        real_dataset = DrivingDataset(
+            real_train_files * args.real_oversample,
+            augment=True,
+            image_height=args.image_height,
+            image_width=args.image_width,
+        )
+        train_dataset = ConcatDataset([sim_dataset, real_dataset])
+
+    if not train_files and not real_train_files:
+        raise RuntimeError("No training samples found.")
+    if not val_files:
+        raise RuntimeError("No validation samples found.")
+
     val_dataset = DrivingDataset(
         val_files,
         augment=False,
         image_height=args.image_height,
         image_width=args.image_width,
     )
+
+    if args.real_dir is None:
+        print(
+            "Dataset split | "
+            f"synthetic_train_samples={len(train_files)} | "
+            f"heldout_val_samples={len(val_files)}"
+        )
+    else:
+        print(
+            "Dataset split | "
+            f"synthetic_train_samples={len(train_files)} | "
+            f"real_train_unique_samples={len(real_train_files)} | "
+            f"real_oversample={args.real_oversample} | "
+            f"epoch_train_samples={len(train_dataset)} | "
+            f"real_holdout_val_samples={len(val_files)}"
+        )
 
     train_loader = DataLoader(
         train_dataset,
@@ -305,7 +383,6 @@ def main() -> None:
         pretrained_backbone=not args.no_pretrained,
         image_feature_dim=args.image_feature_dim,
         history_hidden_dim=args.history_hidden_dim,
-        command_feature_dim=args.command_feature_dim,
         history_layers=args.history_layers,
         fusion_dim=args.fusion_dim,
         fusion_heads=args.fusion_heads,
@@ -321,7 +398,7 @@ def main() -> None:
     for name, parameter in model.named_parameters():
         if not parameter.requires_grad:
             continue
-        if name.startswith("stem."):
+        if name.startswith("stem_layer3.") or name.startswith("stem_layer4."):
             backbone_parameters.append(parameter)
         else:
             head_parameters.append(parameter)
@@ -362,26 +439,13 @@ def main() -> None:
         loaded_state = checkpoint["model_state_dict"]
         model_state = model.state_dict()
 
-        # Rename legacy keys: backbone / vision_encoder -> stem
-        renamed_state = {}
-        for key, value in loaded_state.items():
-            if key.startswith("backbone.") or key.startswith("vision_encoder."):
-                new_key = "stem." + key.split(".", 1)[1]
-            else:
-                new_key = key
-            renamed_state[new_key] = value
-        loaded_state = renamed_state
+        loaded_state = rename_legacy_checkpoint_keys(loaded_state)
 
         reset_keys = []
         if args.reset_trajectory_head_on_resume:
             drop_prefixes = (
+                "trajectory_decoder_cell.",
                 "trajectory_output_head.",
-                "timestep_embedding.",
-                "layer3_token_projection.",
-                "refinement_query_projection.",
-                "refinement_attention.",
-                "trajectory_refinement_decoder.",
-                "trajectory_refinement_head.",
             )
             filtered_for_reset = {}
             for key, value in loaded_state.items():
@@ -442,6 +506,7 @@ def main() -> None:
         if args.freeze_backbone:
             freeze_backbone_batchnorm(model)
         running_loss = 0.0
+        running_ade_loss = 0.0
         running_xy_loss = 0.0
         running_heading_loss = 0.0
         running_fde_loss = 0.0
@@ -470,11 +535,13 @@ def main() -> None:
             batch_size = camera.size(0)
             total_samples += batch_size
             running_loss += loss_metrics["loss"] * batch_size
+            running_ade_loss += loss_metrics["ade_loss"] * batch_size
             running_xy_loss += loss_metrics["xy_loss"] * batch_size
             running_heading_loss += loss_metrics["heading_loss"] * batch_size
             running_fde_loss += loss_metrics["fde_loss"] * batch_size
             progress.set_postfix(
                 loss=f"{running_loss / total_samples:.4f}",
+                ade=f"{running_ade_loss / total_samples:.4f}",
                 xy=f"{running_xy_loss / total_samples:.4f}",
                 fde=f"{running_fde_loss / total_samples:.4f}",
             )
@@ -482,6 +549,7 @@ def main() -> None:
         scheduler.step()
         train_stats = {
             "loss": running_loss / total_samples,
+            "ade_loss": running_ade_loss / total_samples,
             "xy_loss": running_xy_loss / total_samples,
             "heading_loss": running_heading_loss / total_samples,
             "fde_loss": running_fde_loss / total_samples,
@@ -497,10 +565,12 @@ def main() -> None:
         epoch_summary = {
             "epoch": epoch,
             "train_loss": train_stats["loss"],
+            "train_ade_loss": train_stats["ade_loss"],
             "train_xy_loss": train_stats["xy_loss"],
             "train_heading_loss": train_stats["heading_loss"],
             "train_fde_loss": train_stats["fde_loss"],
             "val_loss": val_stats["loss"],
+            "val_ade_loss": val_stats["ade_loss"],
             "val_xy_loss": val_stats["xy_loss"],
             "val_heading_loss": val_stats["heading_loss"],
             "val_fde_loss": val_stats["fde_loss"],
@@ -514,9 +584,11 @@ def main() -> None:
         print(
             f"Epoch {epoch:02d} | "
             f"train_loss={train_stats['loss']:.4f} | "
+            f"train_ade={train_stats['ade_loss']:.4f} | "
             f"train_xy={train_stats['xy_loss']:.4f} | "
             f"train_fde={train_stats['fde_loss']:.4f} | "
             f"val_loss={val_stats['loss']:.4f} | "
+            f"val_ade_loss={val_stats['ade_loss']:.4f} | "
             f"val_xy={val_stats['xy_loss']:.4f} | "
             f"val_fde_loss={val_stats['fde_loss']:.4f} | "
             f"val_ADE={val_stats['ade']:.4f} | "
