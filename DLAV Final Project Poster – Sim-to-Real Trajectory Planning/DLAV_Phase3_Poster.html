@@ -1,0 +1,584 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>End-to-End Planning for Autonomous Driving</title>
+    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:ital,wght@0,300;0,400;0,600;0,700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --hot: #E05C2A;
+            --hot-light: #F5C8AE;
+            --blue: #1A5FB4;
+            --blue-light: #DCE9FB;
+            --teal: #1D9E75;
+            --teal-light: #DDF4EC;
+            --amber: #BA7517;
+            --amber-light: #F8E4BF;
+            --gray-dark: #2C2C2A;
+            --gray-mid: #5F5E5A;
+            --gray-light: #D3D1C7;
+            --gray-pale: #F1EFE8;
+            --white: #FAFAF8;
+            --font: 'IBM Plex Sans', sans-serif;
+            --mono: 'IBM Plex Mono', monospace;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            background: #E5E4DE;
+            font-family: var(--font);
+            color: var(--gray-dark);
+            min-height: 100vh;
+            padding: 10px;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+
+        .poster {
+            width: min(96vw, 1700px);
+            height: min(94vh, 900px);
+            background: var(--white);
+            box-shadow: 0 10px 28px rgba(0, 0, 0, 0.14);
+            overflow: hidden;
+            display: grid;
+            grid-template-rows: auto 5px 1fr;
+        }
+
+        .header {
+            background: var(--gray-dark);
+            color: var(--white);
+            padding: 10px 30px 10px;
+        }
+
+        .header-title {
+            font-size: clamp(22px, 1.9vw, 34px);
+            font-weight: 700;
+            line-height: 1.15;
+            letter-spacing: -0.4px;
+        }
+
+        .header-subtitle {
+            font-size: clamp(12px, 1vw, 17px);
+            font-weight: 300;
+            color: var(--gray-light);
+            margin-top: 6px;
+            letter-spacing: 0.25px;
+        }
+
+        .stripe {
+            background: linear-gradient(90deg, var(--hot) 0%, var(--amber) 34%, var(--teal) 68%, var(--blue) 100%);
+        }
+
+        .content {
+            display: grid;
+            grid-template-columns: 1fr 1fr 1fr;
+            gap: 0;
+            min-height: 0;
+        }
+
+        .col {
+            padding: 14px 18px 14px;
+            border-right: 0.5px solid var(--gray-light);
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+            min-width: 0;
+        }
+
+        .col:last-child {
+            border-right: none;
+        }
+
+        .sec-label {
+            font-family: var(--mono);
+            font-size: 11px;
+            font-weight: 600;
+            letter-spacing: 1.3px;
+            text-transform: uppercase;
+            color: var(--hot);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            margin-bottom: 5px;
+        }
+
+        .sec-label::after {
+            content: "";
+            flex: 1;
+            height: 0.5px;
+            background: var(--hot-light);
+        }
+
+        .sec-label.teal {
+            color: var(--teal);
+        }
+
+        .sec-label.teal::after {
+            background: var(--teal-light);
+        }
+
+        .sec-label.blue {
+            color: var(--blue);
+        }
+
+        .sec-label.blue::after {
+            background: var(--blue-light);
+        }
+
+        .sec-label.amber {
+            color: var(--amber);
+        }
+
+        .sec-label.amber::after {
+            background: var(--amber-light);
+        }
+
+        .sec-title {
+            font-size: 17px;
+            font-weight: 700;
+            line-height: 1.2;
+            margin-bottom: 5px;
+        }
+
+        .body-text {
+            font-size: 12.6px;
+            font-weight: 300;
+            line-height: 1.45;
+            color: var(--gray-mid);
+        }
+
+        .section {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .info-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 8px;
+        }
+
+        .info-card,
+        .metric-card,
+        .curve-box,
+        .arch-diagram,
+        .panel-box {
+            background: var(--gray-pale);
+            border: 0.5px solid var(--gray-light);
+            border-radius: 4px;
+        }
+
+        .info-card {
+            padding: 10px 12px;
+        }
+
+        .info-card h4 {
+            font-family: var(--mono);
+            font-size: 11px;
+            font-weight: 600;
+            letter-spacing: 0.8px;
+            text-transform: uppercase;
+            margin-bottom: 6px;
+            color: var(--gray-dark);
+        }
+
+        .info-card p {
+            font-size: 12.2px;
+            line-height: 1.4;
+            color: var(--gray-mid);
+        }
+
+        .bullet-list {
+            display: flex;
+            flex-direction: column;
+            gap: 7px;
+        }
+
+        .bullet-row {
+            display: flex;
+            align-items: flex-start;
+            gap: 9px;
+            font-size: 12.3px;
+            line-height: 1.38;
+            color: var(--gray-mid);
+        }
+
+        .bullet-tag {
+            flex-shrink: 0;
+            min-width: 58px;
+            padding: 4px 7px;
+            border-radius: 3px;
+            color: var(--white);
+            font-family: var(--mono);
+            font-size: 10.8px;
+            font-weight: 600;
+            text-align: center;
+            background: var(--gray-dark);
+        }
+
+        .bullet-tag.hot {
+            background: var(--hot);
+        }
+
+        .bullet-tag.teal {
+            background: var(--teal);
+        }
+
+        .bullet-tag.blue {
+            background: var(--blue);
+        }
+
+        .bullet-tag.amber {
+            background: var(--amber);
+        }
+
+        .arch-diagram {
+            padding: 8px;
+        }
+
+        .arch-diagram img {
+            width: 100%;
+            height: auto;
+            display: block;
+            border-radius: 3px;
+        }
+
+        .panel-box {
+            padding: 10px 12px;
+        }
+
+        .panel-box.compact {
+            padding: 8px 10px;
+        }
+
+        .mini-list {
+            display: flex;
+            flex-direction: column;
+            gap: 5px;
+        }
+
+        .mini-row {
+            font-size: 11.7px;
+            line-height: 1.34;
+            color: var(--gray-mid);
+        }
+
+        .chips {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+        }
+
+        .chip {
+            border: 0.5px solid var(--gray-light);
+            background: var(--white);
+            border-radius: 999px;
+            padding: 5px 9px;
+            font-family: var(--mono);
+            font-size: 10.8px;
+            color: var(--gray-mid);
+        }
+
+        .chip strong {
+            color: var(--gray-dark);
+            font-weight: 600;
+        }
+
+        .pipeline {
+            display: grid;
+            gap: 7px;
+        }
+
+        .pipe-step {
+            display: grid;
+            grid-template-columns: 24px 1fr;
+            gap: 9px;
+            align-items: start;
+            padding: 9px 11px;
+            background: var(--gray-pale);
+            border: 0.5px solid var(--gray-light);
+            border-radius: 4px;
+        }
+
+        .pipe-num {
+            width: 24px;
+            height: 24px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-family: var(--mono);
+            font-size: 11px;
+            font-weight: 600;
+            color: var(--white);
+            background: var(--gray-mid);
+        }
+
+        .pipe-step.hot .pipe-num {
+            background: var(--hot);
+        }
+
+        .pipe-step.teal .pipe-num {
+            background: var(--teal);
+        }
+
+        .pipe-step.blue .pipe-num {
+            background: var(--blue);
+        }
+
+        .pipe-text {
+            font-size: 12.3px;
+            color: var(--gray-dark);
+            line-height: 1.35;
+        }
+
+        .pipe-text span {
+            display: block;
+            margin-top: 2px;
+            color: var(--gray-mid);
+            font-weight: 300;
+        }
+
+        .metrics-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 8px;
+        }
+
+        .metric-card {
+            padding: 10px 12px;
+        }
+
+        .metric-card.highlight {
+            background: var(--teal-light);
+            border-color: var(--teal);
+        }
+
+        .metric-label {
+            font-family: var(--mono);
+            font-size: 10.8px;
+            font-weight: 600;
+            letter-spacing: 0.7px;
+            text-transform: uppercase;
+            color: var(--gray-mid);
+            margin-bottom: 4px;
+        }
+
+        .metric-value {
+            font-size: 23px;
+            font-weight: 700;
+            line-height: 1;
+            color: var(--gray-dark);
+        }
+
+        .metric-sub {
+            font-size: 11.4px;
+            font-weight: 300;
+            color: var(--gray-mid);
+            margin-top: 4px;
+            line-height: 1.3;
+        }
+
+        .curve-box {
+            padding: 10px 12px;
+        }
+
+        .curve-box svg {
+            width: 100%;
+            height: 140px;
+            display: block;
+        }
+
+        .footer-note {
+            font-size: 11.4px;
+            color: var(--gray-mid);
+            line-height: 1.35;
+        }
+
+        @media print {
+            @page {
+                size: A3 landscape;
+                margin: 0;
+            }
+
+            body {
+                background: none;
+                padding: 0;
+                margin: 0;
+                display: block;
+            }
+
+            .poster {
+                width: 420mm;
+                height: 222mm;
+                max-width: none;
+                box-shadow: none;
+                aspect-ratio: auto;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="poster">
+        <div class="header">
+            <div class="header-title">End-to-End Planning for Autonomous Driving</div>
+            <div class="header-subtitle">DLAV Final Project · EgoDrivePlanner · Zhiyan Ke & Yanpeng Zhang</div>
+        </div>
+        <div class="stripe"></div>
+
+        <div class="content">
+            <div class="col">
+                <section class="section">
+                    <div class="sec-label">Data Preprocessing</div>
+                    <div class="sec-title">Two Inputs: Camera + History Trajectory</div>
+                    <p class="body-text">The planner consumes a front-view RGB image and the ego vehicle's recent motion history. Raw dataset fields are transformed into a model-friendly representation before training.</p>
+                    <div class="info-grid">
+                        <div class="info-card">
+                            <h4>Camera Branch</h4>
+                            <p>Raw frame shape is <strong>(200, 300, 3)</strong>. Each image is resized to <strong>224 x 336</strong>, converted to tensor, normalised, and batched as <strong>(B, 3, 224, 336)</strong>.</p>
+                        </div>
+                        <div class="info-card">
+                            <h4>Ego-Frame History</h4>
+                            <p>Raw history is <strong>(21, 3)</strong> with <strong>x, y, heading</strong>. It is recentered at the last pose and encoded as <strong>x, y, sin(theta), cos(theta)</strong>, then augmented with velocity to form the GRU input.</p>
+                        </div>
+                    </div>
+                </section>
+
+                <section class="section">
+                    <div class="sec-label amber">Auxiliary Heads</div>
+                    <div class="sec-title">Perception-Side Auxiliary Decoder</div>
+                    <div class="panel-box compact">
+                        <div class="mini-list">
+                            <div class="mini-row"><strong>Feature fusion:</strong> layer3 spatial detail and layer4 semantics are projected to 128 channels, upsampled, and decoded jointly.</div>
+                            <div class="mini-row"><strong>Two outputs:</strong> the decoder branches into a 15-class semantic head and a 1-channel depth head at image resolution.</div>
+                            <div class="mini-row"><strong>Role in the model:</strong> these heads enrich the shared visual backbone with dense scene structure while the main planner still predicts the future ego trajectory.</div>
+                        </div>
+                    </div>
+                </section>
+
+                <section class="section">
+                    <div class="sec-label teal">Domain Adaptation</div>
+                    <div class="sec-title">Closing the Sim-to-Real Gap</div>
+                    <p class="body-text">Models trained on synthetic sensor data fail on real-world data due to domain shift. Three complementary strategies are applied.</p>
+                    <div class="pipeline">
+                        <div class="pipe-step hot">
+                            <div class="pipe-num">1</div>
+                            <div class="pipe-text">AdaIN style transfer
+                                <span>Synthetic camera images are shifted toward real-image colour statistics using mean and std estimated from 200 real frames, with alpha = 0.5 blending.</span>
+                            </div>
+                        </div>
+                        <div class="pipe-step teal">
+                            <div class="pipe-num">2</div>
+                            <div class="pipe-text">Mixed-data training
+                                <span>The training set combines 5,000 simulation samples with 500 labelled real samples so the planner sees both appearance domains.</span>
+                            </div>
+                        </div>
+                        <div class="pipe-step blue">
+                            <div class="pipe-num">3</div>
+                            <div class="pipe-text">Real-domain fine-tuning
+                                <span>After mixed training, the entire network is fine-tuned for 20 epochs on real data to reduce the remaining deployment gap.</span>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+            </div>
+
+            <div class="col">
+                <section class="section">
+                    <div class="sec-label amber">Architecture</div>
+                    <div class="sec-title">EgoDrivePlanner</div>
+                    <p class="body-text">The model fuses visual context from a ResNet-34 backbone with a GRU-encoded motion history, then autoregressively predicts a 60-step future trajectory in the ego frame.</p>
+                    <div class="arch-diagram">
+                        <img src="Architecture.png" alt="Architecture Figure">
+
+                </section>
+            </div>
+
+            <div class="col">
+                <section class="section">
+                    <div class="sec-label">Training</div>
+                    <div class="sec-title">Loss, Optimiser, and Key Hyperparameters</div>
+                    <div class="panel-box">
+                        <div class="chips">
+                            <div class="chip"><strong>ADE</strong> x1.0</div>
+                            <div class="chip"><strong>xy SmoothL1</strong> x1.2</div>
+                            <div class="chip"><strong>Heading</strong> x0.1</div>
+                            <div class="chip"><strong>FDE</strong> x1.0</div>
+                            <div class="chip"><strong>clip</strong> 5.0</div>
+                            <div class="chip"><strong>ft xy</strong> x1.5</div>
+                            <div class="chip"><strong>ft FDE</strong> x1.2</div>
+                        </div>
+                    </div>
+                    <div class="bullet-list">
+                        <div class="bullet-row">
+                            <span class="bullet-tag hot">STAGE 1</span>
+                            <span><strong>80 epochs</strong> on mixed sim + real data. AdamW with <strong>lr = 5e-5</strong> for the ResNet backbone and <strong>1e-3</strong> for the prediction head.</span>
+                        </div>
+                        <div class="bullet-row">
+                            <span class="bullet-tag teal">STAGE 2</span>
+                            <span><strong>20 epochs</strong> of real-data fine-tuning using AdamW with uniform <strong>lr = 1e-4</strong> and cosine annealing to <strong>1e-6</strong>.</span>
+                        </div>
+                        <div class="bullet-row">
+                            <span class="bullet-tag blue">SETUP</span>
+                            <span>Batch size <strong>32</strong>, weight decay <strong>1e-4</strong>, image size <strong>224 x 336</strong>, history hidden dim <strong>128</strong>, decoder context <strong>256</strong>.</span>
+                        </div>
+                    </div>
+                </section>
+
+                <section class="section">
+                    <div class="sec-label blue">Results</div>
+                    <div class="sec-title">Validation Performance on Real Data</div>
+                    <div class="metrics-grid">
+                        <div class="metric-card highlight">
+                            <div class="metric-label">Final ADE</div>
+                            <div class="metric-value">1.4788</div>
+                            <div class="metric-sub">Best fine-tuned validation score on real data</div>
+                        </div>
+                        <div class="metric-card">
+                            <div class="metric-label">FDE</div>
+                            <div class="metric-value">4.6191</div>
+                            <div class="metric-sub">Representative fine-tuned validation result</div>
+                        </div>
+                        <div class="metric-card">
+                            <div class="metric-label">Horizon</div>
+                            <div class="metric-value">60</div>
+                            <div class="metric-sub">Autoregressive prediction steps, about 6 seconds</div>
+                        </div>
+                        <div class="metric-card">
+                            <div class="metric-label">Output</div>
+                            <div class="metric-value">4D</div>
+                            <div class="metric-sub">x, y, sin(theta), cos(theta) in ego frame</div>
+                        </div>
+                    </div>
+                    <div class="curve-box">
+                        <svg viewBox="-20 0 320 135" xmlns="http://www.w3.org/2000/svg">
+                            <line x1="28" y1="8" x2="28" y2="88" stroke="#D3D1C7" stroke-width="0.5" />
+                            <line x1="28" y1="88" x2="252" y2="88" stroke="#D3D1C7" stroke-width="0.5" />
+                            <line x1="28" y1="28" x2="252" y2="28" stroke="#D3D1C7" stroke-width="0.3" stroke-dasharray="3 3" />
+                            <line x1="28" y1="48" x2="252" y2="48" stroke="#D3D1C7" stroke-width="0.3" stroke-dasharray="3 3" />
+                            <line x1="28" y1="68" x2="252" y2="68" stroke="#D3D1C7" stroke-width="0.3" stroke-dasharray="3 3" />
+                            <line x1="176" y1="8" x2="176" y2="88" stroke="#E05C2A" stroke-width="0.5" stroke-dasharray="3 2" opacity="0.6" />
+                            <text font-family="'IBM Plex Mono'" font-size="14" fill="#E05C2A" x="178" y="10">fine-tune</text>
+                            <path d="M28 84 C50 76 70 62 90 52 C110 44 130 38 150 33 C165 30 170 29 176 28 C188 26 200 24 220 22 C234 21 244 20 252 19" fill="none" stroke="#1A5FB4" stroke-width="1.5" />
+                            <path d="M28 86 C48 78 68 66 88 56 C108 48 128 40 148 36 C163 33 168 32 176 31 C186 30 200 29 220 28 C234 27.5 244 27 252 27" fill="none" stroke="#B4B2A9" stroke-width="1" stroke-dasharray="3 2" />
+                            <text font-family="'IBM Plex Mono'" font-size="14" fill="#1A5FB4" x="256" y="24">val ADE</text>
+                            <text font-family="'IBM Plex Mono'" font-size="14" fill="#B4B2A9" x="256" y="38">train</text>
+                            <text font-family="'IBM Plex Mono'" font-size="13" fill="#5F5E5A" x="140" y="115" text-anchor="middle">Epoch (0 to 100)</text>
+                            <text font-family="'IBM Plex Mono'" font-size="13" fill="#5F5E5A" x="-4" y="48" text-anchor="middle" transform="rotate(-90 -4 48)">Loss</text>
+                        </svg>
+                    </div>
+                    <p class="footer-note">Mixed-data training plus real-domain fine-tuning reduces the sim-to-real gap while preserving stable long-horizon prediction quality.</p>
+                </section>
+            </div>
+        </div>
+    </div>
+</body>
+</html>
