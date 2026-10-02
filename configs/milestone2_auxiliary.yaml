@@ -1,0 +1,36 @@
+data:
+  train_dir: ./train
+  val_dir: ./val
+  test_dir: ./test_public
+  output_dir: outputs/milestone2_auxiliary
+  image_height: 224
+  image_width: 336
+  submission_name: submission.csv
+
+model:
+  pretrained_backbone: true
+  image_feature_dim: 256
+  history_hidden_dim: 128
+  command_feature_dim: 64
+  history_layers: 2
+  dropout: 0.1
+  future_steps: 60
+  use_command: true
+  fusion: command_film_concat
+  decoder: autoregressive_gru
+  use_depth_head: true
+  use_segmentation_head: true
+  num_segmentation_classes: 15
+
+training:
+  batch_size: 32
+  num_workers: 2
+  epochs: 50
+  lr: 0.0005
+  weight_decay: 0.0001
+  heading_weight: 0.05
+  ade_weight: 1.2
+  fde_weight: 0.1
+  depth_loss_weight: 0.1
+  segmentation_loss_weight: 0.5
+  seed: 42
